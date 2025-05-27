@@ -29,8 +29,5 @@
     "icon": [
       "icons/logo.png",
       "icons/logo-128px.ico"
-    ],
-    "resources": [
-      "files/"
-    ]  }
+    ] }
 }
