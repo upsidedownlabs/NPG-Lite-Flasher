@@ -30,7 +30,7 @@ fn flash_firmware(portname:String,file:String) -> Result<String, String> {
         Ok(buffer)
     };
 
-    let project_path = "icons";
+    let project_path = "files";
     println!("Loading firmware binaries...");
     let app = read_bin(&format!("{}{}", project_path,file))?;
     let ports = serialport::available_ports().map_err(|e| {
