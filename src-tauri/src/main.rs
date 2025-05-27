@@ -1,9 +1,10 @@
+use espflash::{flasher::Flasher, interface::Interface};
+use serialport;
 use std::fs::File;
 use std::io::Read;
 use std::thread::sleep;
 use std::time::Duration;
-use espflash::{flasher::Flasher, interface::Interface};
-use serialport;
+use tauri::Manager;
 
 #[tauri::command]
 fn list_serial_ports() -> Vec<String> {
@@ -18,21 +19,29 @@ fn list_serial_ports() -> Vec<String> {
 }
 
 #[tauri::command]
-fn flash_firmware(portname:String,file:String) -> Result<String, String> {
-    let read_bin = |path: &str| -> Result<Vec<u8>, String> {
-        let mut file = File::open(path).map_err(|e| format!("Failed to open {}: {}", path, e))?;
+fn flash_firmware(app: tauri::AppHandle, portname: String, file: String) -> Result<String, String> {
+    let read_bin = |path: &std::path::Path| -> Result<Vec<u8>, String> {
+        let mut file = File::open(path).map_err(|e| format!("Failed to open {:?}: {}", path, e))?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)
-            .map_err(|e| format!("Failed to read {}: {}", path, e))?;
+            .map_err(|e| format!("Failed to read {:?}: {}", path, e))?;
         if buffer.is_empty() {
-            return Err(format!("File {} is empty", path));
+            return Err(format!("File {:?} is empty", path));
         }
         Ok(buffer)
     };
 
-    let project_path = "files";
-    println!("Loading firmware binaries...");
-    let app = read_bin(&format!("{}{}", project_path,file))?;
+    // Either:
+    let resource_path = app
+        .path()
+        .resolve(
+            &format!("files/{}", file),
+            tauri::path::BaseDirectory::Resource,
+        )
+        .map_err(|e| format!("Failed to resolve resource path: {}", e))?;
+
+    let app = read_bin(&resource_path)?;
+
     let ports = serialport::available_ports().map_err(|e| {
         format!(
             "Failed to list ports: {}. Try 'sudo usermod -a -G dialout $USER' and reboot",
