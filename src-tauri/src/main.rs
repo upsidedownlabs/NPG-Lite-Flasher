@@ -95,7 +95,7 @@ async fn flash_firmware(app: tauri::AppHandle, portname: String, file: String) -
                     }
                 }
             }
-            Err(format!("{} flash failed after 3 retries", name))
+            Err(format!("{} flash failed after 5 retries", name))
         }
 
         println!("Flashing application...");
