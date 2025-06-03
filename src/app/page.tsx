@@ -22,7 +22,7 @@ export default function Home() {
   const [githubFirmwares, setGithubFirmwares] = useState<FirmwareFile[]>([]);
   const [isFetchingGithub, setIsFetchingGithub] = useState(false);
   const [githubRepo, setGithubRepo] = useState('upsidedownlabs/npg-lite-firmware');
-
+  const [downloadingFirmware, setDownloadingFirmware] = useState<string | null>(null);
   // Poll for serial ports at regular intervals
   useEffect(() => {
     const pollInterval = setInterval(() => {
@@ -79,7 +79,8 @@ export default function Home() {
   // Update the handleGithubFirmwareSelect function
   const handleGithubFirmwareSelect = async (url: string, name: string) => {
     try {
-      console.log("Invoking download_and_save_firmware with:", { url, name });
+      setDownloadingFirmware(name);
+      setOutput(`Downloading ${name}...`);
 
       const downloadedName = await core.invoke<string>("download_and_save_firmware", {
         url,
@@ -89,10 +90,13 @@ export default function Home() {
       await loadCustomFirmwares();
       setShowGithubDialog(false);
       handleFirmwareTypeChange(downloadedName);
+      setOutput(`Successfully downloaded ${name}`);
     } catch (err) {
       console.error("Error downloading firmware:", err);
       setOutput(`Error downloading firmware: ${String(err)}`);
       setFlashStatus('error');
+    } finally {
+      setDownloadingFirmware(null);
     }
   };
 
@@ -209,14 +213,15 @@ export default function Home() {
   };
 
   const getStatusColor = () => {
-    if (flashStatus === 'success') return 'bg-green-50 border-green-200 text-green-800';
-    if (flashStatus === 'error') return 'bg-red-50 border-red-200 text-red-800';
-    return 'bg-gray-50 border-gray-200 text-gray-800';
+    if (flashStatus === 'success') return 'bg-green-50 dark:bg-green-900/30 border-green-200 dark:border-green-800 text-green-800 dark:text-green-200';
+    if (flashStatus === 'error') return 'bg-red-50 dark:bg-red-900/30 border-red-200 dark:border-red-800 text-red-800 dark:text-red-200';
+    return 'bg-gray-50 dark:bg-gray-800 border-gray-200 dark:border-gray-700 text-gray-800 dark:text-gray-200';
   };
 
   const getStatusIcon = () => {
-    if (flashStatus === 'success') return <CheckCircle className="h-5 w-5 text-green-500" />;
-    if (flashStatus === 'error') return <AlertCircle className="h-5 w-5 text-red-500" />;
+    if (flashStatus === 'success') return <CheckCircle className="h-5 w-5 text-green-500 dark:text-green-400" />;
+    if (flashStatus === 'error') return <AlertCircle className="h-5 w-5 text-red-500 dark:text-red-400" />;
+    if (downloadingFirmware) return <RefreshCw className="h-5 w-5 text-blue-500 dark:text-blue-400 animate-spin" />;
     return null;
   };
 
@@ -263,11 +268,10 @@ export default function Home() {
               <div
                 key={option.type}
                 onClick={() => handleFirmwareTypeChange(option.type)}
-                className={`border rounded-lg p-4 cursor-pointer transition-all duration-200 hover:shadow-md ${
-                  firmwareType === option.type
-                    ? 'border-blue-500 ring-2 ring-blue-200 dark:ring-blue-400/30 bg-blue-50 dark:bg-blue-900/20'
-                    : 'border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 hover:bg-gray-50 dark:hover:bg-gray-600'
-                }`}
+                className={`border rounded-lg p-4 cursor-pointer transition-all duration-200 hover:shadow-md ${firmwareType === option.type
+                  ? 'border-blue-500 ring-2 ring-blue-200 dark:ring-blue-400/30 bg-blue-50 dark:bg-blue-900/20'
+                  : 'border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 hover:bg-gray-50 dark:hover:bg-gray-600'
+                  }`}
               >
                 <div className="flex items-center text-gray-900 dark:text-white">
                   {getFirmwareIcon(option.type)}
@@ -284,11 +288,10 @@ export default function Home() {
                 {customFirmwares.map((fw) => (
                   <div
                     key={fw}
-                    className={`border rounded-lg p-4 cursor-pointer transition-all duration-200 hover:shadow-md ${
-                      firmwareType === fw
-                        ? 'border-blue-500 ring-2 ring-blue-200 dark:ring-blue-400/30 bg-blue-50 dark:bg-blue-900/20'
-                        : 'border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 hover:bg-gray-50 dark:hover:bg-gray-600'
-                    }`}
+                    className={`border rounded-lg p-4 cursor-pointer transition-all duration-200 hover:shadow-md ${firmwareType === fw
+                      ? 'border-blue-500 ring-2 ring-blue-200 dark:ring-blue-400/30 bg-blue-50 dark:bg-blue-900/20'
+                      : 'border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 hover:bg-gray-50 dark:hover:bg-gray-600'
+                      }`}
                   >
                     <div className="flex justify-between items-center">
                       <div
@@ -344,7 +347,7 @@ export default function Home() {
                     <select
                       onChange={e => setSelectedPort(e.target.value)}
                       value={selectedPort}
-                      className="flex-grow border border-gray-300 dark:border-gray-600 rounded-l-md p-2 focus:ring-blue-500 focus:border-blue-500 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                      className="flex-grow border border-gray-300 dark:border-gray-600 rounded-l-md p-2 focus:ring-blue-500 focus:border-blue-500 bg-white dark:bg-gray-700 text-black-900 dark:text-black"
                       disabled={isFlashing}
                     >
                       <option value="">-- Select Port --</option>
@@ -361,10 +364,12 @@ export default function Home() {
                 </div>
 
                 {output && (
-                  <div className={`border rounded-md p-3 mt-4 ${getStatusColor()}`}>
-                    <div className="flex items-start">
+                  <div className={`border rounded-md p-3 mt-4 ${getStatusColor()} transition-colors duration-200`}>
+                    <div className="flex items-start gap-2">
                       {getStatusIcon()}
-                      <pre className="ml-2 text-sm whitespace-pre-wrap font-mono text-gray-800 dark:text-gray-200">{output}</pre>
+                      <pre className="text-sm whitespace-pre-wrap font-mono flex-1 overflow-x-auto">
+                        {output}
+                      </pre>
                     </div>
                   </div>
                 )}
@@ -381,11 +386,10 @@ export default function Home() {
                   <button
                     onClick={handleFlash}
                     disabled={isFlashing || !selectedPort}
-                    className={`px-4 py-2 rounded-md flex items-center transition-colors ${
-                      !selectedPort
-                        ? 'bg-blue-400 cursor-not-allowed'
-                        : 'bg-blue-600 hover:bg-blue-700'
-                    } text-white`}
+                    className={`px-4 py-2 rounded-md flex items-center transition-colors ${!selectedPort
+                      ? 'bg-blue-400 cursor-not-allowed'
+                      : 'bg-blue-600 hover:bg-blue-700'
+                      } text-white`}
                   >
                     {isFlashing ? (
                       <>
@@ -461,11 +465,10 @@ export default function Home() {
                   <button
                     onClick={handleFileUpload}
                     disabled={isUploading || !selectedFile || !newFirmwareName}
-                    className={`px-4 py-2 rounded-md flex items-center transition-colors ${
-                      !selectedFile || !newFirmwareName
-                        ? 'bg-blue-400 cursor-not-allowed'
-                        : 'bg-blue-600 hover:bg-blue-700'
-                    } text-white`}
+                    className={`px-4 py-2 rounded-md flex items-center transition-colors ${!selectedFile || !newFirmwareName
+                      ? 'bg-blue-400 cursor-not-allowed'
+                      : 'bg-blue-600 hover:bg-blue-700'
+                      } text-white`}
                   >
                     {isUploading ? (
                       <>
@@ -515,17 +518,28 @@ export default function Home() {
                   <div className="space-y-2">
                     {githubFirmwares.map((fws, index) => {
                       const [name, url] = fws;
+                      const isDownloading = downloadingFirmware === name;
+
                       return (
                         <div
                           key={index}
-                          className="border border-gray-300 dark:border-gray-600 rounded-lg p-3 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700 flex justify-between items-center transition-colors"
-                          onClick={() => handleGithubFirmwareSelect(url, name)}
+                          className={`border border-gray-300 dark:border-gray-600 rounded-lg p-3 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700 flex justify-between items-center transition-colors ${isDownloading ? 'bg-blue-50 dark:bg-blue-900/20' : ''
+                            }`}
+                          onClick={() => !isDownloading && handleGithubFirmwareSelect(url, name)}
                         >
                           <div className="flex items-center">
-                            <Download className="h-5 w-5 mr-2 text-blue-600 dark:text-blue-400" />
+                            {isDownloading ? (
+                              <RefreshCw className="h-5 w-5 mr-2 text-blue-600 dark:text-blue-400 animate-spin" />
+                            ) : (
+                              <Download className="h-5 w-5 mr-2 text-blue-600 dark:text-blue-400" />
+                            )}
                             <span className="text-gray-900 dark:text-white truncate">{name || 'Default Name'}</span>
                           </div>
-                          <ArrowRight className="h-5 w-5 text-gray-400 dark:text-gray-500 flex-shrink-0 ml-2" />
+                          {isDownloading ? (
+                            <span className="text-sm text-blue-600 dark:text-blue-400">Downloading...</span>
+                          ) : (
+                            <ArrowRight className="h-5 w-5 text-gray-400 dark:text-gray-500 flex-shrink-0 ml-2" />
+                          )}
                         </div>
                       );
                     })}
