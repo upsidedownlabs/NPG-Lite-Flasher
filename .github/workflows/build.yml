@@ -1,0 +1,248 @@
+name: Build and Release NPG Lite Flasher  App
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  check-version-and-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Get Version from package.json
+        id: get_version
+        run: |
+          version="v$(jq -r '.version' package.json)"
+          echo "::set-output name=version::$version"
+      - name: Check if Tag Exists
+        id: check_tag
+        run: |
+          version="${{ steps.get_version.outputs.version }}"
+          if git rev-parse "$version" >/dev/null 2>&1; then
+            echo "Tag $version already exists."
+            echo "tag_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "Tag $version does not exist."
+            echo "tag_exists=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Create Tag
+        if: steps.check_tag.outputs.tag_exists == 'false'
+        run: |
+          version="${{ steps.get_version.outputs.version }}"
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git tag -a "$version" -m "Release version $version"
+          git push origin "$version"
+  build:
+    needs: check-version-and-tag
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-22.04]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Debug the runner OS
+        run: echo "Running on ${{ runner.os }}"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20  
+
+      - name: Install macOS canvas dependencies
+        if: runner.os == 'macOS'
+        run: |
+            brew install pkg-config cairo pango libpng jpeg giflib librsvg
+                  
+          
+      - name: Install Dependencies
+        run: |
+          npm install
+          npm install tailwindcss-animate
+      - name: Run npm audit
+        run: npm audit --audit-level=high
+
+      - name: Install GTK and Build Tools (Ubuntu only)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libudev-dev build-essential pkg-config
+      - name: Install Tauri CLI (locally)
+        run: npm install @tauri-apps/cli
+
+      - name: Clean npm cache
+        run: npm cache clean --force
+
+      - name: Setup macOS Code Signing & Notarization
+        if: runner.os == 'macOS'
+        env:
+          CERT_DEVELOPER_APP_BASE64: ${{ secrets.CERT_DEVELOPER_APP_BASE64 }}
+          CERT_DEVELOPER_INSTALL_BASE64: ${{ secrets.CERT_DEVELOPER_INSTALL_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APP_PASSWORD }}
+          TEAM_ID: ${{ secrets.TEAM_ID }}
+        run: |
+          echo "$CERT_DEVELOPER_APP_BASE64" | base64 --decode > developer_app.p12
+          echo "$CERT_DEVELOPER_INSTALL_BASE64" | base64 --decode > developer_installer.p12
+
+          security create-keychain -p "" build.keychain-db
+          security default-keychain -s build.keychain-db
+          security unlock-keychain -p "" build.keychain-db
+
+          security import developer_app.p12 -k build.keychain-db -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security import developer_installer.p12 -k build.keychain-db -P "$CERT_PASSWORD" -T /usr/bin/productsign
+
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" build.keychain-db
+
+          xcrun notarytool store-credentials "MAC_PASSWORD" \
+            --apple-id "${{ secrets.APPLE_ID }}" \
+            --team-id "${{ secrets.TEAM_ID }}" \
+            --password "${{ secrets.APP_PASSWORD }}"
+
+      - name: Build Tauri App
+        run: npx tauri build
+
+      - name: Extract .app from .dmg
+        if: runner.os == 'macOS'
+        run: |
+          dmg_path=$(find src-tauri/target/release/bundle/dmg -name "*.dmg" | head -n 1)
+          echo "Mounting $dmg_path"
+          hdiutil attach "$dmg_path" -mountpoint /Volumes/MyApp
+          mkdir -p SignedApp  # Create SignedApp directory if it doesn't exist
+          cp -R /Volumes/MyApp/*.app ./SignedApp
+          hdiutil detach /Volumes/MyApp
+      - name: Sign .app bundle
+        if: runner.os == 'macOS'
+        env:
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          codesign --deep --force --verbose --options runtime \
+            --sign "${MACOS_SIGN_IDENTITY}" \
+            SignedApp/*.app
+          codesign --verify --deep --strict --verbose=2 SignedApp/*.app
+      - name: Verify SignedApp directory contents
+        if: runner.os == 'macOS'
+        run: |
+          ls -l SignedApp
+
+      - name: Rebuild .dmg with signed .app
+        if: runner.os == 'macOS'
+        run: |
+          npm install -g create-dmg
+          mkdir -p rebuilt-dmg
+          npx create-dmg SignedApp/*.app rebuilt-dmg --overwrite
+      - name: Notarize macOS App
+        if: runner.os == 'macOS'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APP_PASSWORD }}
+          TEAM_ID: ${{ secrets.TEAM_ID }}
+        run: |
+          dmg_path=$(find rebuilt-dmg -name "*.dmg" | head -n 1)
+          echo "Submitting for notarization: $dmg_path"
+           xcrun notarytool submit "$dmg_path" \
+          --keychain-profile "MAC_PASSWORD" \
+          --wait
+
+
+      - name: Staple Notarization Ticket
+        if: runner.os == 'macOS'
+        run: |
+          dmg_path=$(find rebuilt-dmg -name "*.dmg" | head -n 1)
+          xcrun stapler staple "$dmg_path"
+      - name: Upload Artifact for macOS
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauri-app-macos
+          path: rebuilt-dmg/*.dmg
+
+
+      - name: Upload Artifact for Windows
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauri-app-windows
+          path: src-tauri/target/release/bundle/msi/*.msi
+
+      - name: Upload Artifact for Linux (deb)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauri-app-linux-deb
+          path: src-tauri/target/release/bundle/deb/*.deb
+
+      - name: Upload Artifact for Linux (rpm)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauri-app-linux-rpm
+          path: src-tauri/target/release/bundle/rpm/*.rpm
+
+  release:
+    needs: [build, check-version-and-tag]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Fetch All Tags
+        run: git fetch --tags
+
+      - name: Verify Created Tag
+        id: verified_version
+        run: |
+          version="v$(jq -r '.version' package.json)"
+          echo "version=$version" >> $GITHUB_OUTPUT
+          echo "Verifying tag $version"
+          if ! git tag -l | grep -q "$version"; then
+            echo "Error: Tag $version not found locally."
+            exit 1
+          fi
+      # Download platform-specific artifacts
+      - name: Download macOS Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tauri-app-macos
+          path: src-tauri/target/release/bundle/dmg
+
+      - name: Download Windows Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tauri-app-windows
+          path: src-tauri/target/release/bundle/msi
+
+      - name: Download Linux Artifact (deb)
+        uses: actions/download-artifact@v4
+        with:
+          name: tauri-app-linux-deb
+          path: src-tauri/target/release/bundle/deb
+
+      - name: Download Linux Artifact (rpm)
+        uses: actions/download-artifact@v4
+        with:
+          name: tauri-app-linux-rpm
+          path: src-tauri/target/release/bundle/rpm
+
+      # Create GitHub Release with only artifacts
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "${{ steps.verified_version.outputs.version }}"
+          files: |
+            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/rpm/*.rpm
+          draft: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
