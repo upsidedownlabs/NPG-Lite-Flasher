@@ -1,4 +1,4 @@
-name: Build and Release Tauri App
+name: Build and Release NPG Lite Flasher  App
 
 on:
   push:
@@ -186,7 +186,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: tauri-app-linux-rpm
-          path: src-tauri/target/release/bundle/rpm
+          path: src-tauri/target/release/bundle/rpm/*.rpm
 
   release:
     needs: [build, check-version-and-tag]
