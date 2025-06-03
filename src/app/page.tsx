@@ -2,7 +2,7 @@
 import { useEffect, useState } from 'react';
 import { core } from "@tauri-apps/api";
 import { AlertCircle, CheckCircle, Cpu, Wifi, Bluetooth, Usb, ArrowRight, RefreshCw, X, Plus, Upload, Trash2, Download, Github } from "lucide-react";
-type FirmwareFile = [string, string]; // [url, name]
+type FirmwareFile = [string, string]; // [name, url]
 
 export default function Home() {
   const [ports, setPorts] = useState<string[]>([]);
@@ -501,7 +501,6 @@ export default function Home() {
                 <button
                   onClick={() => {
                     setShowGithubDialog(false);
-                    setGithubRepo('Amanmahe/npg-lite-firmware');
                   }}
                   className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors"
                 >
