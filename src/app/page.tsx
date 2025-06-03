@@ -163,7 +163,13 @@ export default function Home() {
       alert("Please select a file and enter a name");
       return;
     }
+    const arrayBuffer = await selectedFile.arrayBuffer();
+    const bytes = new Uint8Array(arrayBuffer);
 
+    await core.invoke<string>("save_custom_firmware", {
+      name: newFirmwareName,
+      data: Array.from(bytes)
+    });
     setIsUploading(true);
     try {
       await loadCustomFirmwares();
