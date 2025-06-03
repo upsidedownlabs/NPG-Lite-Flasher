@@ -162,14 +162,6 @@ export default function Home() {
 
     setIsUploading(true);
     try {
-      const arrayBuffer = await selectedFile.arrayBuffer();
-      const bytes = new Uint8Array(arrayBuffer);
-
-      const savedName = await core.invoke<string>("save_custom_firmware", {
-        name: newFirmwareName,
-        data: Array.from(bytes)
-      });
-
       await loadCustomFirmwares();
       setShowUploadDialog(false);
       setNewFirmwareName('');
