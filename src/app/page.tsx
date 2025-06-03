@@ -21,7 +21,7 @@ export default function Home() {
   const [showGithubDialog, setShowGithubDialog] = useState(false);
   const [githubFirmwares, setGithubFirmwares] = useState<FirmwareFile[]>([]);
   const [isFetchingGithub, setIsFetchingGithub] = useState(false);
-  const [githubRepo, setGithubRepo] = useState('upsidedownlabs/npg-lite-firmware');
+  const githubRepo = "upsidedownlabs/npg-lite-firmware";
   const [downloadingFirmware, setDownloadingFirmware] = useState<string | null>(null);
   // Poll for serial ports at regular intervals
   useEffect(() => {
