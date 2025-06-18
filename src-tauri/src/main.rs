@@ -2,6 +2,7 @@ use espflash::{flasher::Flasher, interface::Interface};
 use serialport;
 use tauri::Manager;
 use std::fs;
+use tauri_plugin_shell;
 
 #[tauri::command]
 fn list_serial_ports() -> Vec<String> {
@@ -259,6 +260,7 @@ fn main() {
             save_custom_firmware,
             delete_custom_firmware  // Add this line
         ])
+        .plugin(tauri_plugin_shell::init())
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

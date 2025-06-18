@@ -3,6 +3,8 @@ import { useEffect, useState } from 'react';
 import { core } from "@tauri-apps/api";
 import { AlertCircle, CheckCircle, Cpu, Wifi, Bluetooth, Usb, ArrowRight, RefreshCw, X, Plus, Upload, Trash2, Download, Github } from "lucide-react";
 type FirmwareFile = [string, string]; // [name, url]
+import Link from "next/link";
+import { open } from '@tauri-apps/plugin-shell';
 
 export default function Home() {
   const [ports, setPorts] = useState<string[]>([]);
@@ -23,6 +25,10 @@ export default function Home() {
   const [isFetchingGithub, setIsFetchingGithub] = useState(false);
   const githubRepo = "upsidedownlabs/npg-lite-firmware";
   const [downloadingFirmware, setDownloadingFirmware] = useState<string | null>(null);
+  const [downloadedFirmwares, setDownloadedFirmwares] = useState<string[]>([]);
+  const [flashFromUpload, setFlashFromUpload] = useState(false);
+  const [isFirmwareExists, setIsFirmwareExists] = useState(false);
+
   // Poll for serial ports at regular intervals
   useEffect(() => {
     const pollInterval = setInterval(() => {
@@ -47,11 +53,11 @@ export default function Home() {
     }
   };
 
-  // Update the loadCustomFirmwares function
   const loadCustomFirmwares = async () => {
     try {
       const firmwares = await core.invoke<string[]>("list_custom_firmwares");
       setCustomFirmwares(firmwares);
+      setDownloadedFirmwares(prev => prev.filter(fw => firmwares.includes(fw)));
     } catch (err) {
       console.error("Error loading custom firmwares:", err);
     }
@@ -73,10 +79,16 @@ export default function Home() {
       setIsFetchingGithub(false);
     }
   };
-
-
-  ////
-  // Update the handleGithubFirmwareSelect function
+  useEffect(() => {
+    if (newFirmwareName) {
+      const exists = customFirmwares.some(fw =>
+        fw.toLowerCase() === `${newFirmwareName}.bin`.toLowerCase()
+      );
+      setIsFirmwareExists(exists);
+    } else {
+      setIsFirmwareExists(false);
+    }
+  }, [newFirmwareName, customFirmwares]);
   const handleGithubFirmwareSelect = async (url: string, name: string) => {
     try {
       setDownloadingFirmware(name);
@@ -88,6 +100,7 @@ export default function Home() {
       });
 
       await loadCustomFirmwares();
+      setDownloadedFirmwares(prev => [...prev, name]);
       setShowGithubDialog(false);
       handleFirmwareTypeChange(downloadedName);
       setOutput(`Successfully downloaded ${name}`);
@@ -109,7 +122,9 @@ export default function Home() {
     }
   };
 
-  const handleFlash = async () => {
+  const handleFlash = async (customFirmwareName?: string) => {
+    const firmwareToFlash = customFirmwareName || firmwareType;
+    console.log(firmwareToFlash);
     if (!selectedPort) {
       setOutput("Error: Please select a port first.");
       setFlashStatus('error');
@@ -119,7 +134,7 @@ export default function Home() {
     let file = "";
     let isCustom = false;
 
-    switch (firmwareType) {
+    switch (firmwareToFlash) {
       case "BLE":
         file = "/NPG-LITE-BLE.ino.bin";
         break;
@@ -130,8 +145,7 @@ export default function Home() {
         file = "/NPG-LITE-WiFi.ino.bin";
         break;
       default:
-        // Handle custom firmware
-        file = firmwareType;
+        file = firmwareToFlash;
         isCustom = true;
     }
 
@@ -156,8 +170,6 @@ export default function Home() {
     }
   };
 
-
-  // Update the handleFileUpload function
   const handleFileUpload = async () => {
     if (!selectedFile || !newFirmwareName) {
       alert("Please select a file and enter a name");
@@ -166,24 +178,32 @@ export default function Home() {
     const arrayBuffer = await selectedFile.arrayBuffer();
     const bytes = new Uint8Array(arrayBuffer);
 
-    await core.invoke<string>("save_custom_firmware", {
-      name: newFirmwareName,
-      data: Array.from(bytes)
-    });
     setIsUploading(true);
     try {
+      const firmwareName = await core.invoke<string>("save_custom_firmware", {
+        name: newFirmwareName,
+        data: Array.from(bytes)
+      });
+
       await loadCustomFirmwares();
-      setShowUploadDialog(false);
-      setNewFirmwareName('');
-      setSelectedFile(null);
+      return firmwareName; // Return the firmware name
     } catch (err) {
       console.error("Upload failed:", err);
       alert(`Failed to upload firmware: ${err}`);
+      throw err;
     } finally {
       setIsUploading(false);
     }
   };
 
+  const handleFileChange = (file: File | null) => {
+    setSelectedFile(file);
+    if (file) {
+      // Set the default name to the filename without .bin extension
+      const fileName = file.name.replace(/\.bin$/i, '');
+      setNewFirmwareName(fileName);
+    }
+  };
 
   const handleDeleteFirmware = async (filename: string) => {
     if (!confirm(`Are you sure you want to delete ${filename}?`)) {
@@ -193,11 +213,13 @@ export default function Home() {
     try {
       await core.invoke<void>("delete_custom_firmware", { filename });
       await loadCustomFirmwares();
+      setDownloadedFirmwares(prev => prev.filter(fw => fw !== filename));
     } catch (err) {
       console.error("Error deleting firmware:", err);
       alert(`Failed to delete firmware: ${err}`);
     }
   };
+
   const closePopover = () => {
     setShowPopover(false);
     setFirmwareType('');
@@ -218,6 +240,10 @@ export default function Home() {
     }
   };
 
+  const handleClick = async (url: string) => {
+    await open(url);
+  };
+
   const getStatusColor = () => {
     if (flashStatus === 'success') return 'bg-green-50 dark:bg-green-900/30 border-green-200 dark:border-green-800 text-green-800 dark:text-green-200';
     if (flashStatus === 'error') return 'bg-red-50 dark:bg-red-900/30 border-red-200 dark:border-red-800 text-red-800 dark:text-red-200';
@@ -233,20 +259,25 @@ export default function Home() {
 
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-900">
-      <div className="max-w-4xl mx-auto p-6">
-        <header className="mb-8">
-          <h1 className="text-3xl font-bold text-gray-900 dark:text-white">NPG-Lite-C6 Firmware Flasher</h1>
+      <div className="max-w-4xl mx-auto p-3">
+        <header className="mb-4">
+          <h1 className="text-3xl font-bold text-gray-900 dark:text-white">Neuro PlayGround (NPG) Lite Firmware Flasher</h1>
           <p className="text-gray-600 dark:text-gray-400 mt-2">Select a firmware type to begin flashing your device</p>
         </header>
 
-        <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md border border-gray-200 dark:border-gray-700 p-6 mb-6">
+        <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md border border-gray-200 dark:border-gray-700 p-6 ">
           <div className="flex justify-between items-center mb-4">
-            <h2 className="text-xl font-semibold text-gray-900 dark:text-white">Select Firmware Type</h2>
+            <h2 className="flex items-center text-2xl font-semibold text-gray-900 dark:text-white gap-2">
+              <Link href="/" target="_blank" rel="noopener noreferrer">
+                <div className="font-rancho font-bold text-2xl duration-300 bg-gradient-to-r from-pink-500 via-purple-500 to-blue-500 text-transparent bg-clip-text">
+                  Chords
+                </div>
+              </Link>Firmware </h2>
             <div className="flex gap-2">
               <button
                 onClick={fetchGithubReleases}
                 disabled={isFetchingGithub}
-                className="flex items-center gap-2 px-3 py-1 bg-gray-600 hover:bg-gray-700 dark:bg-gray-500 dark:hover:bg-gray-600 text-white rounded-md text-sm transition-colors"
+                className="flex items-center cursor-pointer gap-2 px-3 py-1 bg-gray-600 hover:bg-gray-700 dark:bg-gray-500 dark:hover:bg-gray-600 text-white rounded-md text-sm transition-colors"
               >
                 {isFetchingGithub ? (
                   <RefreshCw className="animate-spin h-4 w-4" />
@@ -257,8 +288,14 @@ export default function Home() {
                 )}
               </button>
               <button
-                onClick={() => setShowUploadDialog(true)}
-                className="flex items-center gap-2 px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded-md text-sm transition-colors"
+                onClick={() => {
+                  setShowUploadDialog(true);
+                  setFlashFromUpload(false);
+                  setOutput("");
+                  setNewFirmwareName("");
+                  setSelectedFile(null);
+                }}
+                className="flex items-center cursor-pointer gap-2 px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded-md text-sm transition-colors"
               >
                 <Plus size={16} /> Add Custom
               </button>
@@ -267,30 +304,54 @@ export default function Home() {
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             {[
-              { type: "BLE", title: "Bluetooth LE", description: "For wireless Bluetooth connectivity" },
-              { type: "Serial", title: "Serial", description: "For wired USB serial connections" },
-              { type: "WiFi", title: "WiFi", description: "For wireless network connectivity" }
+              { type: "BLE", title: "Bluetooth LE", description: "For wireless Bluetooth LE connectivity" },
+              { type: "Serial", title: "Serial", description: "For direct wired USB serial connections " },
+              { type: "WiFi", title: "WiFi", description: "For wireless WiFi network connectivity" }
             ].map((option) => (
               <div
                 key={option.type}
                 onClick={() => handleFirmwareTypeChange(option.type)}
-                className={`border rounded-lg p-4 cursor-pointer transition-all duration-200 hover:shadow-md ${firmwareType === option.type
-                  ? 'border-blue-500 ring-2 ring-blue-200 dark:ring-blue-400/30 bg-blue-50 dark:bg-blue-900/20'
-                  : 'border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 hover:bg-gray-50 dark:hover:bg-gray-600'
-                  }`}
+                className="group relative p-[2px] rounded-lg bg-gradient-to-r from-pink-500 via-purple-500 to-blue-500 transition-all duration-300 "
               >
-                <div className="flex items-center text-gray-900 dark:text-white">
-                  {getFirmwareIcon(option.type)}
-                  <span className="font-medium">{option.title}</span>
+                <div
+                  className={`relative rounded-lg p-4 cursor-pointer transition-all duration-200 border ${firmwareType === option.type
+                    ? 'border-blue-500 ring-2 ring-blue-200 dark:ring-blue-400/30 bg-blue-50 dark:bg-blue-900/20'
+                    : 'border-transparent bg-white dark:bg-gray-700 hover:bg-gray-50 dark:hover:bg-gray-600'
+                    }`}
+                >
+                  <div className="flex items-center text-gray-900 dark:text-white">
+                    {getFirmwareIcon(option.type)}
+                    <span className="font-medium">{option.title}</span>
+                  </div>
+                  <p className="text-gray-600 dark:text-gray-400 text-sm mt-2">{option.description}</p>
                 </div>
-                <p className="text-gray-600 dark:text-gray-400 text-sm mt-2">{option.description}</p>
               </div>
             ))}
+          </div>
 
-            {customFirmwares.length > 0 && (
-              <>
-                <div className="col-span-full border-t border-gray-300 dark:border-gray-600 my-4"></div>
-                <h3 className="col-span-full text-lg font-medium text-gray-900 dark:text-white">Custom Firmwares</h3>
+          <div className='flex w-full items-center gap-2 p-2 bg-blue-50 dark:bg-blue-900/20 rounded-lg border border-blue-200 dark:border-blue-800 mt-4 '>
+            <span className="text-gray-900 dark:text-white text-sm pl-2">Visualise your bio-potential signals on</span>
+
+            <button
+              onClick={() => handleClick("https://chords.upsidedownlabs.tech/npg-lite")}
+              className="flex items-center gap-2 px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded-md text-sm transition-colors cursor-pointer "
+            >
+              Chords-Web (recommended)
+            </button>
+
+            <button
+              onClick={() => handleClick("https://github.com/upsidedownlabs/Chords-Python")}
+              className="flex items-center gap-2 px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded-md text-sm transition-colors cursor-pointer"
+            >
+              Chords-Python
+            </button>
+          </div>
+
+          {customFirmwares.length > 0 ? (
+            <>
+              <div className="border-t border-gray-300 dark:border-gray-600 my-4"></div>
+              <h3 className="text-lg font-medium text-gray-900 dark:text-white mb-4">Custom Firmwares</h3>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 {customFirmwares.map((fw) => (
                   <div
                     key={fw}
@@ -321,11 +382,244 @@ export default function Home() {
                     <p className="text-gray-600 dark:text-gray-400 text-sm mt-2">Custom firmware</p>
                   </div>
                 ))}
-              </>
-            )}
-          </div>
+              </div>
+            </>
+          ) : (
+            <>
+              <h3 className="text-lg font-medium text-gray-900 dark:text-white mb-2 mt-4">Custom Firmwares</h3>
+              <div className="bg-gray-50 dark:bg-gray-800 rounded-lg p-6 border border-gray-200 dark:border-gray-700">
+                <div className="mb-4 p-2 bg-red-50 dark:bg-red-900/20 rounded-lg border border-red-200 dark:border-red-800">
+                  <div className="flex items-center space-x-2">
+                    <div className="w-2 h-2 bg-red-500 rounded-full"></div>
+                    <p className="text-white text-sm font-medium">
+                      No custom firmwares added, once added, your custom firmwares will appear here for flashing.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="space-x-6 flex">
+                  <div className="bg-white dark:bg-gray-700 rounded-lg p-4 border border-gray-200 dark:border-gray-600">
+                    <div className="flex items-start space-x-3">
+                      <div className="flex-shrink-0 w-8 h-8 bg-blue-100 dark:bg-blue-900 rounded-full flex items-center justify-center">
+                        <span className="text-blue-600 dark:text-blue-200 font-semibold text-sm">1</span>
+                      </div>
+                      <div>
+                        <h5 className="font-medium text-gray-900 dark:text-white mb-2">
+                          NPG Lite Firmwares from GitHub
+                        </h5>
+                        <p className="text-gray-600 dark:text-gray-400 text-sm">
+                          Click on <span className="font-semibold text-blue-600 dark:text-blue-400 cursor-pointer"> <a
+                            rel="noopener noreferrer"
+                            onClick={fetchGithubReleases}
+                          >
+                            <Github className="h-4 w-4 inline" /> Get from GitHub
+                          </a></span> button.
+                          A popover will show with a list of available firmwares. You can download any firmware from the list,
+                          and it will be automatically added to your custom firmwares.
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="bg-white dark:bg-gray-700 rounded-lg p-4 border border-gray-200 dark:border-gray-600">
+                    <div className="flex items-start space-x-3">
+                      <div className="flex-shrink-0 w-8 h-8 bg-green-100 dark:bg-green-900 rounded-full flex items-center justify-center">
+                        <span className="text-green-600 dark:text-green-400 font-semibold text-sm">2</span>
+                      </div>
+                      <div>
+                        <h5 className="font-medium text-gray-900 dark:text-white mb-2">
+                          Upload Your Custom ESP32 Binary
+                        </h5>
+                        <p className="text-gray-600 dark:text-gray-400 text-sm">
+                          Click on <span className="font-semibold text-green-600 dark:text-green-400 cursor-pointer"><a
+                            rel="noopener noreferrer"
+                            onClick={() => setShowUploadDialog(true)}
+                          >
+                            <Plus size={16} className="inline" /> Add Custom
+                          </a></span> button.
+                          A popover will appear where you can upload your binary file from your system.
+                          Give it a custom name and click<span className="font-semibold text-green-600 dark:text-green-400">&quot;Upload Firmware&quot;</span>
+                          to add it.
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </>
+          )}
         </div>
 
+        {showUploadDialog && (
+          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+            <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl max-w-md w-full border border-gray-200 dark:border-gray-700">
+              <div className="border-b border-gray-200 dark:border-gray-700 p-4 flex justify-between items-center">
+                <h2 className="text-xl font-semibold text-gray-900 dark:text-white">Upload Custom Firmware</h2>
+                <button
+                  onClick={() => {
+                    setShowUploadDialog(false);
+                    setOutput("");
+                  }}
+                  className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors cursor-pointer"
+                  disabled={isUploading} // Disable close while uploading/flashing
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+
+              <div className="p-6 text-gray-900 dark:text-white">
+                <div className="mb-4">
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                    Firmware File (.bin)
+                  </label>
+                  <div className="flex items-center">
+                    <label className={`flex items-center px-4 py-2 border rounded-md cursor-pointer transition-colors ${isUploading
+                      ? 'bg-gray-100 dark:bg-gray-700 border-gray-300 dark:border-gray-600 text-gray-400 dark:text-gray-500 cursor-not-allowed'
+                      : 'bg-gray-100 dark:bg-gray-700 border-gray-300 dark:border-gray-600 hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-900 dark:text-white'
+                      }`}>
+                      <Upload className="h-5 w-5 mr-2" />
+                      {selectedFile ? selectedFile.name : "Choose File"}
+                      <input
+                        type="file"
+                        accept=".bin"
+                        onChange={(e) => !isUploading && handleFileChange(e.target.files?.[0] || null)}
+                        className="hidden"
+                        disabled={isUploading}
+                      />
+                    </label>
+                  </div>
+                </div>
+
+                <div className="mb-4">
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                    Firmware Name
+                  </label>
+                  <input
+                    type="text"
+                    value={newFirmwareName}
+                    onChange={(e) => setNewFirmwareName(e.target.value)}
+                    placeholder="e.g., MyCustomFirmware"
+                    className="w-full border border-gray-300 dark:border-gray-600 rounded-md p-2 focus:ring-blue-500 focus:border-blue-500 bg-white dark:bg-gray-700 text-gray-900 dark:text-white placeholder-gray-500 dark:placeholder-gray-400"
+                    disabled={isUploading}
+                  />
+                </div>
+                {isFirmwareExists && (
+                  <div className="my-2 p-2 bg-red-50 dark:bg-red-900/20 rounded-lg border border-red-200 dark:border-red-800">
+                    <div className="flex items-center space-x-2">
+                      <p className="pl-2 text-red-800 dark:text-red-200 text-sm">
+                        A firmware with this name already exists. Adding it again will overwrite the existing firmware.
+                      </p>
+                    </div>
+                  </div>
+                )}
+                <div className="mb-4">
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                    Select Serial Port
+                  </label>
+                  <div className="flex">
+                    <select
+                      onChange={e => setSelectedPort(e.target.value)}
+                      value={selectedPort}
+                      className="flex-grow border border-gray-300 dark:border-gray-600 rounded-md p-2 focus:ring-blue-500 focus:border-blue-500 bg-white dark:bg-gray-700 text-black-900 dark:text-black"
+                      disabled={isUploading}
+                    >
+                      <option value="">-- Select Port --</option>
+                      {ports.map((p) => <option key={p} value={p}>{p}</option>)}
+                    </select>
+                    <button
+                      onClick={refreshPorts}
+                      className="bg-gray-100 dark:bg-gray-700 border border-l-0 border-gray-300 dark:border-gray-600 rounded-r-md px-3 hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors"
+                      disabled={isUploading || isRefreshing}
+                    >
+                      <RefreshCw className={`h-5 w-5 text-gray-600 dark:text-gray-400 ${isRefreshing ? 'animate-spin' : ''}`} />
+                    </button>
+                  </div>
+                </div>
+
+                {output && (
+                  <div className={`border rounded-md p-3 mt-4 ${getStatusColor()} transition-colors duration-200`}>
+                    <div className="flex items-start gap-2">
+                      {getStatusIcon()}
+                      <pre className="text-sm whitespace-pre-wrap font-mono flex-1 overflow-x-auto">
+                        {output}
+                      </pre>
+                    </div>
+                  </div>
+                )}
+
+                <div className="flex justify-end mt-6">
+                  <div className="flex space-x-3 items-end">
+                    <button
+                      onClick={() => {
+                        setShowUploadDialog(false);
+                        setOutput("");
+                      }}
+                      className="px-4 py-2 border cursor-pointer border-gray-300 dark:border-gray-600 rounded-md text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
+                      disabled={isUploading || isFlashing}
+                    >
+                      Cancel
+                    </button>
+
+                    <button
+                      onClick={async () => {
+                        try {
+                          setFlashFromUpload(false);
+                          await handleFileUpload();
+                          setShowUploadDialog(false);
+                        } catch(err) {
+                          console.warn(err);
+                        }
+                      }}
+                      disabled={isUploading || !selectedFile || !newFirmwareName || isFlashing}
+                      className={`px-4 py-2 rounded-md flex items-center transition-colors ${!selectedFile || !newFirmwareName || isFlashing
+                        ? 'bg-gray-400 cursor-not-allowed'
+                        : 'bg-blue-600 hover:bg-blue-700 cursor-pointer'
+                        } text-white`}
+                    >
+                      {isUploading && !flashFromUpload ? (
+                        <>
+                          <RefreshCw className="animate-spin h-4 w-4 mr-2" />
+                          Adding...
+                        </>
+                      ) : (
+                        'Add'
+                      )}
+                    </button>
+
+                    <button
+                      onClick={async () => {
+                        try {
+                          setFlashFromUpload(true);
+                          const firmwareName = await handleFileUpload();
+                          if (firmwareName && selectedPort) {
+                            await handleFlash(firmwareName);
+                          }
+                        } catch (err) {
+                          console.warn(err);
+                        }
+                      }}
+                      disabled={isUploading || !selectedFile || !newFirmwareName || !selectedPort || isFlashing}
+                      className={`px-4 py-2 rounded-md flex items-center transition-colors ${!selectedFile || !newFirmwareName || !selectedPort || isFlashing
+                        ? 'bg-gray-400 cursor-not-allowed'
+                        : 'bg-green-600 hover:bg-green-700 cursor-pointer'
+                        } text-white`}
+                    >
+                      {isFlashing ? (
+                        <>
+                          <RefreshCw className="animate-spin h-4 w-4 mr-2" />
+                          Flashing...
+                        </>
+                      ) : (
+                        'Flash'
+                      )}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+        {/* Other dialogs (showPopover, showGithubDialog) remain the same */}
         {showPopover && (
           <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
             <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl max-w-md w-full border border-gray-200 dark:border-gray-700">
@@ -383,18 +677,26 @@ export default function Home() {
                 <div className="flex justify-end space-x-3 mt-6">
                   <button
                     onClick={closePopover}
-                    className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
+                    className="px-4 py-2 border cursor-pointer border-gray-300 dark:border-gray-600 rounded-md text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
                     disabled={isFlashing}
                   >
                     Cancel
                   </button>
 
                   <button
-                    onClick={handleFlash}
-                    disabled={isFlashing || !selectedPort}
-                    className={`px-4 py-2 rounded-md flex items-center transition-colors ${!selectedPort
-                      ? 'bg-blue-400 cursor-not-allowed'
-                      : 'bg-blue-600 hover:bg-blue-700'
+                    onClick={async () => {
+                      try {
+                        await handleFlash();
+                        // Only close if successful (handleFileUpload will throw on error)
+                        setShowUploadDialog(false);
+                      } catch (err) {
+                        console.warn(err);
+                      }
+                    }}
+                    disabled={isFlashing}
+                    className={`px-4 py-2 rounded-md flex items-center transition-colors ${!selectedPort || isFlashing
+                      ? 'bg-gray-400 cursor-not-allowed'
+                      : 'bg-green-600 hover:bg-green-700 cursor-pointer'
                       } text-white`}
                   >
                     {isFlashing ? (
@@ -403,86 +705,7 @@ export default function Home() {
                         Flashing...
                       </>
                     ) : (
-                      <>
-                        Flash <ArrowRight className="ml-2 h-4 w-4" />
-                      </>
-                    )}
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {showUploadDialog && (
-          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-            <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl max-w-md w-full border border-gray-200 dark:border-gray-700">
-              <div className="border-b border-gray-200 dark:border-gray-700 p-4 flex justify-between items-center">
-                <h2 className="text-xl font-semibold text-gray-900 dark:text-white">Upload Custom Firmware</h2>
-                <button
-                  onClick={() => setShowUploadDialog(false)}
-                  className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors"
-                >
-                  <X className="h-5 w-5" />
-                </button>
-              </div>
-
-              <div className="p-6 text-gray-900 dark:text-white">
-                <div className="mb-4">
-                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                    Firmware Name
-                  </label>
-                  <input
-                    type="text"
-                    value={newFirmwareName}
-                    onChange={(e) => setNewFirmwareName(e.target.value)}
-                    placeholder="e.g., MyCustomFirmware"
-                    className="w-full border border-gray-300 dark:border-gray-600 rounded-md p-2 focus:ring-blue-500 focus:border-blue-500 bg-white dark:bg-gray-700 text-gray-900 dark:text-white placeholder-gray-500 dark:placeholder-gray-400"
-                  />
-                </div>
-
-                <div className="mb-4">
-                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                    Firmware File (.bin)
-                  </label>
-                  <div className="flex items-center">
-                    <label className="flex items-center px-4 py-2 bg-gray-100 dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-md cursor-pointer hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-900 dark:text-white transition-colors">
-                      <Upload className="h-5 w-5 mr-2" />
-                      {selectedFile ? selectedFile.name : "Choose File"}
-                      <input
-                        type="file"
-                        accept=".bin"
-                        onChange={(e) => setSelectedFile(e.target.files?.[0] || null)}
-                        className="hidden"
-                      />
-                    </label>
-                  </div>
-                </div>
-
-                <div className="flex justify-end space-x-3 mt-6">
-                  <button
-                    onClick={() => setShowUploadDialog(false)}
-                    className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
-                    disabled={isUploading}
-                  >
-                    Cancel
-                  </button>
-
-                  <button
-                    onClick={handleFileUpload}
-                    disabled={isUploading || !selectedFile || !newFirmwareName}
-                    className={`px-4 py-2 rounded-md flex items-center transition-colors ${!selectedFile || !newFirmwareName
-                      ? 'bg-blue-400 cursor-not-allowed'
-                      : 'bg-blue-600 hover:bg-blue-700'
-                      } text-white`}
-                  >
-                    {isUploading ? (
-                      <>
-                        <RefreshCw className="animate-spin h-4 w-4 mr-2" />
-                        Uploading...
-                      </>
-                    ) : (
-                      "Upload Firmware"
+                      'Flash'
                     )}
                   </button>
                 </div>
@@ -524,17 +747,21 @@ export default function Home() {
                     {githubFirmwares.map((fws, index) => {
                       const [name, url] = fws;
                       const isDownloading = downloadingFirmware === name;
+                      const isDownloaded = downloadedFirmwares.includes(name) && customFirmwares.includes(name);
 
                       return (
                         <div
                           key={index}
                           className={`border border-gray-300 dark:border-gray-600 rounded-lg p-3 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700 flex justify-between items-center transition-colors ${isDownloading ? 'bg-blue-50 dark:bg-blue-900/20' : ''
+                            } ${isDownloaded ? 'border-green-300 dark:border-green-700' : ''
                             }`}
-                          onClick={() => !isDownloading && handleGithubFirmwareSelect(url, name)}
+                          onClick={() => !isDownloading && !isDownloaded && handleGithubFirmwareSelect(url, name)}
                         >
                           <div className="flex items-center">
                             {isDownloading ? (
                               <RefreshCw className="h-5 w-5 mr-2 text-blue-600 dark:text-blue-400 animate-spin" />
+                            ) : isDownloaded ? (
+                              <CheckCircle className="h-5 w-5 mr-2 text-green-600 dark:text-green-400" />
                             ) : (
                               <Download className="h-5 w-5 mr-2 text-blue-600 dark:text-blue-400" />
                             )}
@@ -542,6 +769,8 @@ export default function Home() {
                           </div>
                           {isDownloading ? (
                             <span className="text-sm text-blue-600 dark:text-blue-400">Downloading...</span>
+                          ) : isDownloaded ? (
+                            <span className="text-sm text-green-600 dark:text-green-400">Downloaded</span>
                           ) : (
                             <ArrowRight className="h-5 w-5 text-gray-400 dark:text-gray-500 flex-shrink-0 ml-2" />
                           )}
