@@ -1,6 +1,6 @@
 [package]
 name = "NPG-Lite-Flasher"
-version = "0.1.0"
+version = "0.2.0"
 description = "Rust based flashing program for NPG Lite"
 authors = ["Aman Maheshwari", "Deepak Khatri"]
 license = "GPL-3.0"
@@ -27,3 +27,5 @@ espflash = "2.0.0"
 serialport = "4.2"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.11", features = ["json"] }
+tauri-plugin-shell = { git = "https://github.com/tauri-apps/plugins-workspace", branch = "v2" }
+

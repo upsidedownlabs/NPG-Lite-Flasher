@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "NPG-Lite-Flasher",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "com.upsidedownlabs.npg-lite-flasher",
   "build": {
     "frontendDist": "../out",
@@ -12,9 +12,10 @@
   "app": {
     "windows": [
       {
+        "label": "main",                     
         "title": "NPG Lite Flasher",
-        "width": 800,
-        "height": 600,
+        "width": 900,
+        "height": 700,
         "resizable": true,
         "fullscreen": false
       }
