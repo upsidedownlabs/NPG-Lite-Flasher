@@ -1,6 +1,6 @@
 [package]
 name = "NPG-Lite-Flasher"
-version = "0.1.1"
+version = "0.2.0"
 description = "Rust based flashing program for NPG Lite"
 authors = ["Aman Maheshwari", "Deepak Khatri"]
 license = "GPL-3.0"
