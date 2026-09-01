@@ -27,4 +27,4 @@ espflash = "2.0.0"
 serialport = "4.10"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.13", features = ["json"] }
-tauri-plugin-shell = { git = "https://github.com/tauri-apps/plugins-workspace", branch = "v2" }
+tauri-plugin-shell = "2.3.6"
