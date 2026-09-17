@@ -134,12 +134,16 @@ jobs:
         run: |
           ls -l SignedApp
 
-      - name: Rebuild .dmg with signed .app
+      - name: Rebuild .dmg with signed .app and versioned name
         if: runner.os == 'macOS'
         run: |
-          npm install -g create-dmg
+          version="$(jq -r '.version' package.json)"
           mkdir -p rebuilt-dmg
-          npx create-dmg SignedApp/*.app rebuilt-dmg --overwrite
+          hdiutil create -volname "NPG-Lite-Flasher" \
+            -srcfolder SignedApp \
+            -ov -format UDZO \
+            "rebuilt-dmg/NPG-Lite-Flasher.${version}.dmg"
+            
       - name: Notarize macOS App
         if: runner.os == 'macOS'
         env:
