@@ -1,4 +1,3 @@
-use espflash::{flasher::Flasher, interface::Interface};
 use serde::{Deserialize, Serialize};
 use serialport;
 use std::collections::BTreeMap;
@@ -6,8 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
-use tauri::Manager;
-use tauri_plugin_shell;
+use tauri::{Emitter, Manager};
+use tauri_plugin_shell::{self, process::CommandEvent, ShellExt};
 
 // ---------------------------------------------------------------------------
 // Firmware sources: GitHub releases, served through each repo's Cloudflare Worker
@@ -26,10 +25,31 @@ const CHORDS_FILES: [(&str, &str); 3] = [
     ("WiFi", "Chords-NPG-LITE-WiFi-ESP32C6.merged.bin"),
 ];
 
-/// Merged images cover the whole 4 MB flash and start with the ESP image magic byte.
+/// Merged images cover the whole 4 MB flash: bootloader image at 0x0, app image at 0x10000.
 const MERGED_IMAGE_SIZE: usize = 4 * 1024 * 1024;
+const APP_IMAGE_OFFSET: usize = 0x10000;
 const ESP_IMAGE_MAGIC: u8 = 0xE9;
+/// Chip ID in the ESP image header (u16 little-endian at offset 12). 13 = ESP32-C6.
+const ESP32C6_CHIP_ID: u16 = 13;
+const NOT_MERGED_C6_IMAGE: &str =
+    "This file is not an ESP32-C6 merged firmware image (*.merged.bin, 4 MB). It cannot be flashed.";
 const HTTP_USER_AGENT: &str = "NPG-Lite-Flasher";
+
+/// Accepts only a 4 MB ESP32-C6 merged image: an ESP32-C6 bootloader image at 0x0
+/// and an ESP32-C6 app image at 0x10000.
+fn check_merged_c6_image(data: &[u8]) -> Result<(), String> {
+    let c6_image_at = |offset: usize| {
+        data.len() >= offset + 14
+            && data[offset] == ESP_IMAGE_MAGIC
+            && u16::from_le_bytes([data[offset + 12], data[offset + 13]]) == ESP32C6_CHIP_ID
+    };
+
+    if data.len() == MERGED_IMAGE_SIZE && c6_image_at(0) && c6_image_at(APP_IMAGE_OFFSET) {
+        Ok(())
+    } else {
+        Err(NOT_MERGED_C6_IMAGE.to_string())
+    }
+}
 
 #[derive(Deserialize)]
 struct WorkerAsset {
@@ -143,20 +163,7 @@ async fn download_firmware(url: &str, dest: &Path) -> Result<(), String> {
         .await
         .map_err(|e| format!("Failed to download {}: {}", file_name, e))?;
 
-    if bytes.len() != MERGED_IMAGE_SIZE {
-        return Err(format!(
-            "Downloaded {} is {} bytes, expected {} bytes (a 4 MB merged image)",
-            file_name,
-            bytes.len(),
-            MERGED_IMAGE_SIZE
-        ));
-    }
-    if bytes[0] != ESP_IMAGE_MAGIC {
-        return Err(format!(
-            "Downloaded {} is not an ESP firmware image (first byte 0x{:02X}, expected 0x{:02X})",
-            file_name, bytes[0], ESP_IMAGE_MAGIC
-        ));
-    }
+    check_merged_c6_image(&bytes).map_err(|e| format!("Downloaded {}: {}", file_name, e))?;
 
     let dir = dest
         .parent()
@@ -453,16 +460,24 @@ async fn save_custom_firmware(app: tauri::AppHandle, name: String, data: Vec<u8>
     let firmware_dir = app.path()
         .resolve("files/custom", tauri::path::BaseDirectory::AppData)
         .map_err(|e| format!("Failed to resolve custom firmware path: {}", e))?;
-    
+
     // Ensure the filename ends with .bin
     let filename = if name.ends_with(".bin") {
         name
     } else {
         format!("{}.bin", name)
     };
-    
+    if !is_plain_file_name(&filename) {
+        return Err(format!("Invalid firmware name: {}", filename));
+    }
+
+    // Reject anything that is not an ESP32-C6 merged image; nothing is saved.
+    check_merged_c6_image(&data)?;
+
     let path = firmware_dir.join(&filename);
-    
+
+    fs::create_dir_all(&firmware_dir)
+        .map_err(|e| format!("Failed to create custom firmware directory: {}", e))?;
     fs::write(&path, &data)
         .map_err(|e| format!("Failed to save firmware {}: {}", filename, e))?;
 
@@ -475,106 +490,195 @@ async fn save_custom_firmware(app: tauri::AppHandle, name: String, data: Vec<u8>
     Ok(filename)
 }
 
+/// Short status for the Flash button, from one line of esptool output.
+/// Keep these short: the button has a fixed width.
+fn flash_stage(line: &str) -> Option<String> {
+    let l = line.trim().to_ascii_lowercase();
+    if l.contains("hard resetting") {
+        Some("Restarting...".to_string())
+    } else if l.contains("hash of data verified") {
+        Some("Verified".to_string())
+    } else if l.starts_with("wrote ") {
+        Some("Verifying...".to_string())
+    } else if l.starts_with("writing at") {
+        Some(match percent_in(&l) {
+            Some(p) => format!("Flashing {}%", p),
+            None => "Flashing...".to_string(),
+        })
+    } else if l.contains("stub")
+        || l.contains("changing baud")
+        || l.contains("configuring flash")
+        || l.contains("will be erased")
+        || l.starts_with("compressed ")
+    {
+        Some("Preparing...".to_string())
+    } else if l.starts_with("connecting") {
+        Some("Connecting...".to_string())
+    } else {
+        None
+    }
+}
+
+/// The number just before the first '%' in `line`, e.g. "... 42.5% ..." or "(42 %)" -> 42.
+fn percent_in(line: &str) -> Option<u32> {
+    let before = line[..line.find('%')?].trim_end();
+    let start = before
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| c.is_ascii_digit() || *c == '.')
+        .last()
+        .map(|(i, _)| i)?;
+    before[start..].parse::<f32>().ok().map(|p| p.round().min(100.0) as u32)
+}
+
+/// The bundled esptool. Installed apps have it next to the app executable (Tauri sidecar).
+/// In development builds it may be missing there: with Cargo's newer build-dir layout,
+/// tauri-build copies the sidecar into target/<profile>/build/ instead, so fall back to
+/// the file downloaded by `npm run fetch-esptool`.
+fn esptool_command(app: &tauri::AppHandle) -> Result<tauri_plugin_shell::process::Command, String> {
+    let exe_name = format!("npg-esptool{}", std::env::consts::EXE_SUFFIX);
+    let next_to_app = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(&exe_name)));
+    if next_to_app.as_deref().is_some_and(Path::is_file) {
+        return app
+            .shell()
+            .sidecar("npg-esptool")
+            .map_err(|e| format!("Could not start the bundled esptool: {}", e));
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        let dev_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries").join(format!(
+            "npg-esptool-{}{}",
+            env!("TAURI_ENV_TARGET_TRIPLE"),
+            std::env::consts::EXE_SUFFIX
+        ));
+        if dev_path.is_file() {
+            return Ok(app.shell().command(dev_path));
+        }
+    }
+
+    Err(format!(
+        "The bundled esptool ({}) was not found next to the app. Please reinstall the app.",
+        exe_name
+    ))
+}
+
 #[tauri::command]
 async fn flash_firmware(app: tauri::AppHandle, portname: String, file: String, iscustom: bool) -> Result<String, String> {
-    tokio::task::spawn_blocking(move || {
-        use std::{fs::File, io::Read, thread::sleep, time::Duration};
+    if !is_plain_file_name(&file) {
+        return Err(format!("Invalid firmware name: {}", file));
+    }
 
-        let read_bin = |path: &std::path::Path| -> Result<Vec<u8>, String> {
-            let mut file = File::open(path).map_err(|e| format!("Failed to open {:?}: {}", path, e))?;
-            let mut buffer = Vec::new();
-            file.read_to_end(&mut buffer)
-                .map_err(|e| format!("Failed to read {:?}: {}", path, e))?;
-            if buffer.is_empty() {
-                return Err(format!("File {:?} is empty", path));
-            }
-            Ok(buffer)
-        };
+    let firmware_path = if iscustom {
+        app.path()
+            .resolve(&format!("files/custom/{}", file), tauri::path::BaseDirectory::AppData)
+            .map_err(|e| format!("Failed to resolve custom firmware path: {}", e))?
+    } else {
+        app.path()
+            .resolve(&format!("files/chords/{}", file), tauri::path::BaseDirectory::AppData)
+            .map_err(|e| format!("Failed to resolve Chords firmware path: {}", e))?
+    };
 
-        let resource_path = if iscustom {
-            app.path()
-                .resolve(&format!("files/custom/{}", file), tauri::path::BaseDirectory::AppData)
-                .map_err(|e| format!("Failed to resolve custom firmware path: {}", e))?
-        } else {
-            app.path()
-                .resolve(&format!("files/chords/{}", file), tauri::path::BaseDirectory::AppData)
-                .map_err(|e| format!("Failed to resolve Chords firmware path: {}", e))?
-        };
+    let data = fs::read(&firmware_path)
+        .map_err(|e| format!("Failed to read {:?}: {}", firmware_path, e))?;
+    check_merged_c6_image(&data)?;
+    drop(data);
 
-        let app = read_bin(&resource_path)?;
+    let firmware_arg = firmware_path.to_string_lossy().into_owned();
 
-        let ports = serialport::available_ports().map_err(|e| {
-            format!("Failed to list ports: {}. Try 'sudo usermod -a -G dialout $USER' and reboot", e)
-        })?;
+    // Arduino IDE's upload command for ESP32-C6, writing the merged image at 0x0.
+    let (mut events, _child) = esptool_command(&app)?
+        .args([
+            "--chip", "esp32c6",
+            "--port", portname.as_str(),
+            "--baud", "921600",
+            "--before", "default-reset",
+            "--after", "hard-reset",
+            "write-flash",
+            "-z",
+            "--flash-mode", "keep",
+            "--flash-freq", "keep",
+            "--flash-size", "keep",
+            "0x0", firmware_arg.as_str(),
+        ])
+        // esptool is a Python program: write UTF-8 so its output always decodes, and
+        // don't buffer it, so progress reaches the app while flashing.
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUNBUFFERED", "1")
+        .spawn()
+        .map_err(|e| format!("Could not run esptool: {}", e))?;
 
-        let port_info = ports
-            .iter()
-            .find(|p| p.port_name == portname)
-            .ok_or_else(|| {
-                let available = ports.iter().map(|p| &p.port_name).collect::<Vec<_>>();
-                format!("Port {} not found. Available ports: {:?}", portname, available)
-            })?;
-
-        let usb_info = match &port_info.port_type {
-            serialport::SerialPortType::UsbPort(info) => info,
-            _ => return Err(format!("Port {} is not a USB port", portname)),
-        };
-
-        println!("Connecting to interface...");
-        let interface = (0..3)
-            .find_map(|attempt| {
-                let result = Interface::new(&port_info.clone(), Some(1), Some(1))
-                    .map_err(|e| format!("Attempt {}: {}", attempt + 1, e));
-                if result.is_ok() || attempt == 2 {
-                    Some(result)
-                } else {
-                    sleep(Duration::from_millis(500));
-                    None
-                }
-            })
-            .unwrap_or_else(|| Err("Failed to create interface after 3 attempts".into()))?;
-
-        let mut flasher = Flasher::connect(interface, usb_info.clone(), Some(921600), false)
-            .map_err(|e| format!("Failed to connect to device: {}", e))?;
-
-        fn retry_flash(
-            flasher: &mut Flasher,
-            addr: u32,
-            data: &[u8],
-            name: &str,
-        ) -> Result<(), String> {
-            for i in 0..5 {
-                match flasher.write_bin_to_flash(addr, data, None) {
-                    Ok(_) => {
-                        println!("{} flashed successfully (attempt {}).", name, i + 1);
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        if i == 4 {
-                            return Err(format!(
-                                "{} flash failed at 0x{:X} ({} bytes): {}",
-                                name, addr, data.len(), e
-                            ));
-                        }
-                        println!("Retrying {} flash (attempt {})...", name, i + 2);
-                        sleep(Duration::from_millis(500));
+    // Read esptool's output as it arrives and tell the UI which stage it is in.
+    let mut combined = String::new();
+    let mut exit_code: Option<i32> = None;
+    let mut last_stage = String::new();
+    while let Some(event) = events.recv().await {
+        match event {
+            CommandEvent::Stdout(bytes) | CommandEvent::Stderr(bytes) => {
+                let line = String::from_utf8_lossy(&bytes);
+                combined.push_str(&line);
+                combined.push('\n');
+                if let Some(stage) = flash_stage(&line) {
+                    if stage != last_stage {
+                        let _ = app.emit("flash-progress", &stage);
+                        last_stage = stage;
                     }
                 }
             }
-            Err(format!("{} flash failed after 5 retries", name))
+            CommandEvent::Error(e) => {
+                combined.push_str(&e);
+                combined.push('\n');
+            }
+            CommandEvent::Terminated(payload) => exit_code = payload.code,
+            _ => {}
         }
+    }
 
-        println!("Flashing application...");
-        retry_flash(&mut flasher, 0x10000, &app, "Application")?;
-        sleep(Duration::from_millis(500));
+    println!("---- esptool (exit code {:?}) ----", exit_code);
+    println!("{}", combined.trim_end());
+    println!("---- end of esptool output ----");
 
-        Ok("✅ Firmware flashed successfully! The device should now reboot.".to_string())
-    })
-    .await
-    .map_err(|e| format!("Thread error: {:?}", e))?
+    match exit_code {
+        Some(0) if combined.contains("Hash of data verified") => {
+            // With --after hard-reset, esptool has already restarted the board when it exits.
+            // That restart cannot leave download mode if it was entered by holding BOOT while
+            // plugging in (the chip only reads BOOT at power-up), and esptool's output looks
+            // the same in that case, so always tell the user how to recover.
+            if combined.to_ascii_lowercase().contains("hard resetting") {
+                Ok("Firmware flashed and verified. The board has been restarted with the new firmware.\n\
+                    If it does not start (for example, because BOOT was held while plugging it in), \
+                    unplug the board and plug it back in."
+                    .to_string())
+            } else {
+                Ok("Firmware flashed and verified. Unplug and replug the board to start it.".to_string())
+            }
+        }
+        Some(0) => Err(
+            "esptool finished but did not confirm that the written data was verified \
+             (no \"Hash of data verified\" in its output). Please flash again."
+                .to_string(),
+        ),
+        code => {
+            let lines: Vec<&str> = combined
+                .split(|c| c == '\n' || c == '\r')
+                .map(str::trim_end)
+                .filter(|line| !line.trim().is_empty())
+                .collect();
+            let tail = lines[lines.len().saturating_sub(15)..].join("\n");
+            let code = code.map_or_else(|| "none".to_string(), |c| c.to_string());
+            Err(format!("Flashing failed (esptool exit code {}):\n{}", code, tail))
+        }
+    }
 }
+
 #[tauri::command]
 async fn delete_custom_firmware(app: tauri::AppHandle, filename: String) -> Result<String, String> {
+    if !is_plain_file_name(&filename) {
+        return Err(format!("Invalid firmware name: {}", filename));
+    }
+
     let firmware_dir = app.path()
         .resolve("files/custom", tauri::path::BaseDirectory::AppData)
         .map_err(|e| format!("Failed to resolve custom firmware path: {}", e))?;

@@ -1,6 +1,7 @@
 "use client"
 import { useEffect, useState } from 'react';
 import { core } from "@tauri-apps/api";
+import { listen } from "@tauri-apps/api/event";
 import { AlertCircle, CheckCircle, Cpu, Wifi, Bluetooth, Usb, ArrowRight, RefreshCw, X, Plus, Upload, Trash2, Download, Github } from "lucide-react";
 type FirmwareFile = [string, string]; // [name, url]
 import Link from "next/link";
@@ -67,6 +68,7 @@ export default function Home() {
   const [firmwareType, setFirmwareType] = useState('');
   const [showPopover, setShowPopover] = useState(false);
   const [isFlashing, setIsFlashing] = useState(false);
+  const [flashStage, setFlashStage] = useState(''); // live status from esptool, shown on the Flash button
   const [flashStatus, setFlashStatus] = useState(''); // 'success', 'error', or ''
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [customFirmwares, setCustomFirmwares] = useState<string[]>([]);
@@ -97,6 +99,20 @@ export default function Home() {
     syncChordsFirmwares();
 
     return () => clearInterval(pollInterval); // Cleanup on unmount
+  }, []);
+
+  // Live flashing stage sent by flash_firmware ("Connecting...", "Flashing... 42%", ...).
+  useEffect(() => {
+    let stopListening: (() => void) | undefined;
+    let cancelled = false;
+    listen<string>("flash-progress", (event) => setFlashStage(event.payload)).then((unlisten) => {
+      if (cancelled) unlisten();
+      else stopListening = unlisten;
+    });
+    return () => {
+      cancelled = true;
+      stopListening?.();
+    };
   }, []);
 
   const syncChordsFirmwares = async () => {
@@ -229,10 +245,12 @@ export default function Home() {
 
     setIsFlashing(true);
     setFlashStatus('');
+    setFlashStage('');
 
     // Notes shown above the flash result, e.g. that a project firmware was just updated.
     let notes = "";
     if (isCustom) {
+      setFlashStage("Checking...");
       setOutput("Checking for firmware updates...");
       try {
         const update = await core.invoke<ProjectUpdate>("ensure_latest_project", { name: file });
@@ -246,6 +264,7 @@ export default function Home() {
       }
     }
 
+    setFlashStage("Connecting...");
     setOutput(`${notes}Flashing firmware, please wait...`);
 
     try {
@@ -264,6 +283,7 @@ export default function Home() {
       setIsFlashed(false);
     } finally {
       setIsFlashing(false);
+      setFlashStage('');
     }
   };
 
@@ -276,6 +296,8 @@ export default function Home() {
     const bytes = new Uint8Array(arrayBuffer);
 
     setIsUploading(true);
+    setOutput('');
+    setFlashStatus('');
     try {
       const firmwareName = await core.invoke<string>("save_custom_firmware", {
         name: newFirmwareName,
@@ -286,7 +308,8 @@ export default function Home() {
       return firmwareName; // Return the firmware name
     } catch (err) {
       console.error("Upload failed:", err);
-      alert(`Failed to upload firmware: ${err}`);
+      setOutput(`Error: ${String(err)}`);
+      setFlashStatus('error');
       throw err;
     } finally {
       setIsUploading(false);
@@ -666,7 +689,7 @@ export default function Home() {
                   <div className={`border rounded-md p-3 mt-4 ${getStatusColor()} transition-colors duration-200`}>
                     <div className="flex items-start gap-2">
                       {getStatusIcon()}
-                      <pre className="text-sm whitespace-pre-wrap font-mono flex-1 overflow-x-auto">
+                      <pre className="text-sm whitespace-pre-wrap break-words font-mono flex-1 min-w-0 max-h-48 overflow-auto">
                         {output}
                       </pre>
                     </div>
@@ -736,7 +759,7 @@ export default function Home() {
                           }
                         }}
                         disabled={isFlashing || isFlashed || !selectedPort}
-                        className={`px-4 py-2 rounded-md flex items-center transition-colors ${!selectedPort || isFlashing
+                        className={`w-44 px-4 py-2 rounded-md flex items-center justify-center whitespace-nowrap tabular-nums transition-colors ${!selectedPort || isFlashing
                             ? 'bg-gray-400 cursor-not-allowed'
                             : isFlashed
                               ? 'bg-green-600 cursor-not-allowed'
@@ -746,7 +769,7 @@ export default function Home() {
                         {isFlashing ? (
                           <>
                             <RefreshCw className="animate-spin h-4 w-4 mr-2" />
-                            Flashing...
+                            {flashStage || 'Flashing...'}
                           </>
                         ) : isFlashed ? (
                           'Flashed'
@@ -811,7 +834,7 @@ export default function Home() {
                   <div className={`border rounded-md p-3 mt-4 ${getStatusColor()} transition-colors duration-200`}>
                     <div className="flex items-start gap-2">
                       {getStatusIcon()}
-                      <pre className="text-sm whitespace-pre-wrap font-mono flex-1 overflow-x-auto">
+                      <pre className="text-sm whitespace-pre-wrap break-words font-mono flex-1 min-w-0 max-h-48 overflow-auto">
                         {output}
                       </pre>
                     </div>
@@ -838,7 +861,7 @@ export default function Home() {
                       }
                     }}
                     disabled={isFlashing || isFlashed}
-                    className={`px-4 py-2 rounded-md flex items-center transition-colors ${!selectedPort || isFlashing
+                    className={`w-44 px-4 py-2 rounded-md flex items-center justify-center whitespace-nowrap tabular-nums transition-colors ${!selectedPort || isFlashing
                         ? 'bg-gray-400 cursor-not-allowed'
                         : isFlashed
                           ? 'bg-green-600 cursor-not-allowed'
@@ -848,7 +871,7 @@ export default function Home() {
                     {isFlashing ? (
                       <>
                         <RefreshCw className="animate-spin h-4 w-4 mr-2" />
-                        Flashing...
+                        {flashStage || 'Flashing...'}
                       </>
                     ) : isFlashed ? (
                       'Flashed'
