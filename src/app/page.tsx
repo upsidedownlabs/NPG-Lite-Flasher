@@ -6,6 +6,60 @@ type FirmwareFile = [string, string]; // [name, url]
 import Link from "next/link";
 import { open } from '@tauri-apps/plugin-shell';
 
+// Chords firmware: merged images from upsidedownlabs/Chords-Arduino-Firmware releases,
+// kept up to date in AppData/files/chords/ by sync_chords_firmwares.
+const CHORDS_FILES: Record<string, string> = {
+  BLE: "Chords-NPG-LITE-BLE-ESP32C6.merged.bin",
+  Serial: "Chords-NPG-LITE-Serial-ESP32C6.merged.bin",
+  WiFi: "Chords-NPG-LITE-WiFi-ESP32C6.merged.bin",
+};
+
+type ChordsFirmwareStatus = {
+  kind: string;
+  file: string;
+  available: boolean;
+  tag: string | null;
+  downloaded: boolean;
+  updated: boolean;
+  error: string | null;
+};
+type ChordsSyncResult = { online: boolean; latestTag: string | null; firmwares: ChordsFirmwareStatus[] };
+type ProjectFirmwareList = { tag: string; firmwares: FirmwareFile[] };
+type ProjectUpdate = {
+  status: "updated" | "upToDate" | "offline" | "untracked" | "notInRelease" | "failed";
+  tag: string | null;
+  previousTag: string | null;
+  error: string | null;
+};
+
+// One sync per page load, even though React Strict Mode runs effects twice in development.
+let chordsSyncPromise: Promise<ChordsSyncResult> | null = null;
+const syncChordsOnce = () => {
+  chordsSyncPromise ??= core.invoke<ChordsSyncResult>("sync_chords_firmwares");
+  return chordsSyncPromise;
+};
+
+const describeChordsSync = (result: ChordsSyncResult): string => {
+  const available = result.firmwares.filter(f => f.available);
+  const errors = result.firmwares.filter(f => f.error).map(f => `${f.kind}: ${f.error}`);
+  const withErrors = (line: string) => (errors.length ? `${line}\n${errors.join("\n")}` : line);
+
+  if (available.length === 0) {
+    return withErrors("Chords firmware not downloaded yet. Connect to the internet and restart the app.");
+  }
+
+  const tags = [...new Set(available.map(f => f.tag ?? "unknown version"))].join(", ");
+  let line: string;
+  if (!result.online) line = `Offline: using saved Chords firmware (${tags})`;
+  else if (available.some(f => f.updated)) line = `Updated Chords firmware to ${tags}`;
+  else if (available.some(f => f.downloaded)) line = `Downloaded Chords firmware (${tags})`;
+  else line = `Chords firmware ready (${tags})`;
+
+  const missing = result.firmwares.filter(f => !f.available).map(f => f.kind);
+  if (missing.length) line += `. Not available yet: ${missing.join(", ")}`;
+  return withErrors(line);
+};
+
 export default function Home() {
   const [ports, setPorts] = useState<string[]>([]);
   const [selectedPort, setSelectedPort] = useState('');
@@ -23,7 +77,9 @@ export default function Home() {
   const [showGithubDialog, setShowGithubDialog] = useState(false);
   const [githubFirmwares, setGithubFirmwares] = useState<FirmwareFile[]>([]);
   const [isFetchingGithub, setIsFetchingGithub] = useState(false);
-  const githubRepo = "upsidedownlabs/npg-lite-firmware";
+  const [githubTag, setGithubTag] = useState('');
+  const [chordsSync, setChordsSync] = useState<ChordsSyncResult | null>(null);
+  const [chordsNotice, setChordsNotice] = useState('Checking for the latest Chords firmware...');
   const [downloadingFirmware, setDownloadingFirmware] = useState<string | null>(null);
   const [downloadedFirmwares, setDownloadedFirmwares] = useState<string[]>([]);
   const [flashFromUpload, setFlashFromUpload] = useState(false);
@@ -38,9 +94,26 @@ export default function Home() {
     // Initial load
     refreshPorts();
     loadCustomFirmwares();
+    syncChordsFirmwares();
 
     return () => clearInterval(pollInterval); // Cleanup on unmount
   }, []);
+
+  const syncChordsFirmwares = async () => {
+    let notice: string;
+    try {
+      const result = await syncChordsOnce();
+      setChordsSync(result);
+      notice = describeChordsSync(result);
+    } catch (err) {
+      console.error("Error syncing Chords firmware:", err);
+      setChordsSync({ online: false, latestTag: null, firmwares: [] });
+      notice = `Could not prepare Chords firmware: ${String(err)}`;
+    }
+    console.log(notice);
+    setChordsNotice(notice);
+    setOutput(notice);
+  };
 
   const refreshPorts = async () => {
     setIsRefreshing(true);
@@ -66,10 +139,9 @@ export default function Home() {
   const fetchGithubReleases = async () => {
     setIsFetchingGithub(true);
     try {
-      const releases = await core.invoke<FirmwareFile[]>("fetch_github_releases", {
-        repo: githubRepo
-      });
-      setGithubFirmwares(releases);
+      const release = await core.invoke<ProjectFirmwareList>("list_project_firmwares");
+      setGithubFirmwares(release.firmwares);
+      setGithubTag(release.tag);
       setShowGithubDialog(true);
     } catch (err) {
       console.error("Error fetching GitHub releases:", err);
@@ -96,7 +168,8 @@ export default function Home() {
 
       const downloadedName = await core.invoke<string>("download_and_save_firmware", {
         url,
-        name
+        name,
+        tag: githubTag
       });
 
       await loadCustomFirmwares();
@@ -119,7 +192,7 @@ export default function Home() {
     if (type) {
       setShowPopover(true);
       setFlashStatus('');
-      setOutput('');
+      setOutput(CHORDS_FILES[type] ? chordsNotice : '');
     }
   };
 
@@ -135,24 +208,45 @@ export default function Home() {
     let file = "";
     let isCustom = false;
 
-    switch (firmwareToFlash) {
-      case "BLE":
-        file = "/NPG-LITE-BLE.ino.bin";
-        break;
-      case "Serial":
-        file = "/NPG-LITE.ino.bin";
-        break;
-      case "WiFi":
-        file = "/NPG-LITE-WiFi.ino.bin";
-        break;
-      default:
-        file = firmwareToFlash;
-        isCustom = true;
+    const chordsFile = CHORDS_FILES[firmwareToFlash];
+    if (chordsFile) {
+      if (!chordsSync) {
+        setOutput("Error: Still checking for the latest Chords firmware. Please try again in a moment.");
+        setFlashStatus('error');
+        return;
+      }
+      const status = chordsSync.firmwares.find(f => f.file === chordsFile);
+      if (!status?.available) {
+        setOutput(`Error: Chords ${firmwareToFlash} firmware is not downloaded yet. Connect to the internet and restart the app.`);
+        setFlashStatus('error');
+        return;
+      }
+      file = chordsFile;
+    } else {
+      file = firmwareToFlash;
+      isCustom = true;
     }
 
     setIsFlashing(true);
-    setOutput("Flashing firmware, please wait...");
     setFlashStatus('');
+
+    // Notes shown above the flash result, e.g. that a project firmware was just updated.
+    let notes = "";
+    if (isCustom) {
+      setOutput("Checking for firmware updates...");
+      try {
+        const update = await core.invoke<ProjectUpdate>("ensure_latest_project", { name: file });
+        if (update.status === "updated") {
+          notes = `Updated ${file} from ${update.previousTag} to ${update.tag}.\n`;
+        } else if (update.status === "failed") {
+          notes = `Could not update ${file}: ${update.error}. Flashing the saved copy.\n`;
+        }
+      } catch (err) {
+        notes = `Could not check for updates: ${String(err)}\n`;
+      }
+    }
+
+    setOutput(`${notes}Flashing firmware, please wait...`);
 
     try {
       const result = await core.invoke("flash_firmware", {
@@ -160,12 +254,12 @@ export default function Home() {
         file: file,
         iscustom: isCustom
       });
-      setOutput(`Success: ${String(result)}`);
+      setOutput(`${notes}Success: ${String(result)}`);
       setFlashStatus('success');
       setIsFlashed(true);
     } catch (err) {
       console.error("Flash failed:", err);
-      setOutput(`Error: ${String(err)}`);
+      setOutput(`${notes}Error: ${String(err)}`);
       setFlashStatus('error');
       setIsFlashed(false);
     } finally {
