@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "fetch-esptool": "node scripts/fetch-esptool.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",

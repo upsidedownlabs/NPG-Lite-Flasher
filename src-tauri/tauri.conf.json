@@ -31,6 +31,7 @@
       "icons/logo.png",
       "icons/logo-128px.ico"
     ],
-    "resources": ["files/NPG-LITE-BLE.ino.bin","files/NPG-LITE.ino.bin","files/NPG-LITE-WiFi.ino.bin"]
+    "resources": ["files/NPG-LITE-BLE.ino.bin","files/NPG-LITE.ino.bin","files/NPG-LITE-WiFi.ino.bin"],
+    "externalBin": ["binaries/npg-esptool"]
   }
 }
