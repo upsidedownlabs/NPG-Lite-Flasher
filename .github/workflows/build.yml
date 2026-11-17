@@ -3,13 +3,15 @@ name: Build and Release NPG Lite Flasher App
 on:
   push:
     branches:
-      - main
+      - '**'
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
   check-version-and-tag:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'upsidedownlabs/NPG-Lite-Flasher'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -44,7 +46,10 @@ jobs:
 
   build:
     needs: check-version-and-tag
+    if: ${{ !failure() && !cancelled() }}
     runs-on: ${{ matrix.os }}
+    env:
+      HAS_APPLE_SIGNING: ${{ secrets.CERT_DEVELOPER_APP_BASE64 != '' }}
     strategy:
       matrix:
         os: [macos-latest, windows-latest, ubuntu-22.04]
@@ -89,7 +94,7 @@ jobs:
         run: npm cache clean --force
 
       - name: Setup macOS Code Signing & Notarization
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && env.HAS_APPLE_SIGNING == 'true'
         env:
           CERT_DEVELOPER_APP_BASE64: ${{ secrets.CERT_DEVELOPER_APP_BASE64 }}
           CERT_DEVELOPER_INSTALL_BASE64: ${{ secrets.CERT_DEVELOPER_INSTALL_BASE64 }}
@@ -133,11 +138,27 @@ jobs:
             --team-id "$TEAM_ID" \
             --password "$APPLE_PASSWORD"
 
+      - name: Download esptool
+        run: npm run fetch-esptool
+
       - name: Build Tauri App
         run: npx tauri build
 
-      - name: Extract .app from .dmg
+      - name: Check bundled esptool runs
         if: runner.os == 'macOS'
+        run: src-tauri/target/release/bundle/macos/*.app/Contents/MacOS/npg-esptool version
+
+      - name: Check bundled esptool runs
+        if: runner.os == 'Linux'
+        run: src-tauri/binaries/npg-esptool-x86_64-unknown-linux-gnu version
+
+      - name: Check bundled esptool runs
+        if: runner.os == 'Windows'
+        shell: bash
+        run: src-tauri/binaries/npg-esptool-x86_64-pc-windows-msvc.exe version
+
+      - name: Extract .app from .dmg
+        if: runner.os == 'macOS' && env.HAS_APPLE_SIGNING == 'true'
         run: |
           dmg_path=$(find src-tauri/target/release/bundle/dmg -name "*.dmg" | head -n 1)
           echo "Mounting $dmg_path"
@@ -147,7 +168,7 @@ jobs:
           hdiutil detach /Volumes/MyApp
 
       - name: Sign .app bundle
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && env.HAS_APPLE_SIGNING == 'true'
         env:
           MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
         run: |
@@ -161,13 +182,19 @@ jobs:
 
           codesign --verify --deep --strict --verbose=2 SignedApp/*.app
 
+      - name: Check signed esptool runs
+        if: runner.os == 'macOS' && env.HAS_APPLE_SIGNING == 'true'
+        run: |
+          codesign -dv --verbose=2 SignedApp/*.app/Contents/MacOS/npg-esptool
+          SignedApp/*.app/Contents/MacOS/npg-esptool version
+
       - name: Verify SignedApp directory contents
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && env.HAS_APPLE_SIGNING == 'true'
         run: |
           ls -l SignedApp
 
       - name: Rebuild .dmg with signed .app and versioned name
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && env.HAS_APPLE_SIGNING == 'true'
         run: |
           version="$(jq -r '.version' package.json)"
           mkdir -p rebuilt-dmg
@@ -177,7 +204,7 @@ jobs:
             "rebuilt-dmg/NPG-Lite-Flasher.${version}.dmg"
 
       - name: Notarize macOS App
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && env.HAS_APPLE_SIGNING == 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APP_PASSWORD }}
@@ -190,17 +217,24 @@ jobs:
             --wait
 
       - name: Staple Notarization Ticket
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && env.HAS_APPLE_SIGNING == 'true'
         run: |
           dmg_path=$(find rebuilt-dmg -name "*.dmg" | head -n 1)
           xcrun stapler staple "$dmg_path"
 
-      - name: Upload Artifact for macOS
-        if: runner.os == 'macOS'
+      - name: Upload Artifact for macOS (signed)
+        if: runner.os == 'macOS' && env.HAS_APPLE_SIGNING == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: tauri-app-macos
           path: rebuilt-dmg/*.dmg
+
+      - name: Upload Artifact for macOS (unsigned)
+        if: runner.os == 'macOS' && env.HAS_APPLE_SIGNING != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauri-app-macos
+          path: src-tauri/target/release/bundle/dmg/*.dmg
 
       - name: Upload Artifact for Windows
         if: runner.os == 'Windows'
@@ -225,6 +259,7 @@ jobs:
 
   release:
     needs: [build, check-version-and-tag]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'upsidedownlabs/NPG-Lite-Flasher'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
