@@ -1,5 +1,5 @@
 "use client"
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { core } from "@tauri-apps/api";
 import { listen } from "@tauri-apps/api/event";
 import { AlertCircle, CheckCircle, Cpu, Wifi, Bluetooth, Usb, ArrowRight, RefreshCw, X, Plus, Upload, Trash2, Download, Github } from "lucide-react";
@@ -15,6 +15,7 @@ const CHORDS_FILES: Record<string, string> = {
   WiFi: "Chords-NPG-LITE-WiFi-ESP32C6.merged.bin",
 };
 const CHORDS_CHECKING_NOTICE = 'Checking for the latest Chords firmware...';
+const CHORDS_STILL_CHECKING_ERROR = 'Error: Still checking for the latest Chords firmware. Please try again in a moment.';
 
 type ChordsFirmwareStatus = {
   kind: string;
@@ -66,6 +67,8 @@ export default function Home() {
   const [ports, setPorts] = useState<string[]>([]);
   const [selectedPort, setSelectedPort] = useState('');
   const [output, setOutput] = useState('');
+  const outputRef = useRef(output); // latest output, read by the async Chords check
+  outputRef.current = output;
   const [firmwareType, setFirmwareType] = useState('');
   const [showPopover, setShowPopover] = useState(false);
   const [isFlashing, setIsFlashing] = useState(false);
@@ -129,7 +132,11 @@ export default function Home() {
     }
     console.log(notice);
     setChordsNotice(notice);
-    setOutput(prev => (prev === CHORDS_CHECKING_NOTICE ? notice : prev));
+    // Replace only our own "checking" text, never another message, and drop the error styling with it.
+    if (outputRef.current === CHORDS_CHECKING_NOTICE || outputRef.current === CHORDS_STILL_CHECKING_ERROR) {
+      setOutput(notice);
+      setFlashStatus('');
+    }
   };
 
   const refreshPorts = async () => {
@@ -228,7 +235,7 @@ export default function Home() {
     const chordsFile = CHORDS_FILES[firmwareToFlash];
     if (chordsFile) {
       if (!chordsSync) {
-        setOutput("Error: Still checking for the latest Chords firmware. Please try again in a moment.");
+        setOutput(CHORDS_STILL_CHECKING_ERROR);
         setFlashStatus('error');
         return;
       }
