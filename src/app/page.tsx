@@ -14,6 +14,7 @@ const CHORDS_FILES: Record<string, string> = {
   Serial: "Chords-NPG-LITE-Serial-ESP32C6.merged.bin",
   WiFi: "Chords-NPG-LITE-WiFi-ESP32C6.merged.bin",
 };
+const CHORDS_CHECKING_NOTICE = 'Checking for the latest Chords firmware...';
 
 type ChordsFirmwareStatus = {
   kind: string;
@@ -81,7 +82,7 @@ export default function Home() {
   const [isFetchingGithub, setIsFetchingGithub] = useState(false);
   const [githubTag, setGithubTag] = useState('');
   const [chordsSync, setChordsSync] = useState<ChordsSyncResult | null>(null);
-  const [chordsNotice, setChordsNotice] = useState('Checking for the latest Chords firmware...');
+  const [chordsNotice, setChordsNotice] = useState(CHORDS_CHECKING_NOTICE);
   const [downloadingFirmware, setDownloadingFirmware] = useState<string | null>(null);
   const [downloadedFirmwares, setDownloadedFirmwares] = useState<string[]>([]);
   const [flashFromUpload, setFlashFromUpload] = useState(false);
@@ -128,7 +129,7 @@ export default function Home() {
     }
     console.log(notice);
     setChordsNotice(notice);
-    setOutput(notice);
+    setOutput(prev => (prev === CHORDS_CHECKING_NOTICE ? notice : prev));
   };
 
   const refreshPorts = async () => {
