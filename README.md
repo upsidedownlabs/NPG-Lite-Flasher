@@ -1,6 +1,6 @@
 ![NPG Lite Flasher](app.png)
 # NPG-Lite-Flasher
-Rust based flashing program for NPG Lite.
+Flashing app for NPG Lite. It flashes the same way as Arduino IDE, using esptool.
 
 ## Installation Instructions
 ### Windows  
@@ -14,4 +14,5 @@ This will allow the app to run without issues.
 ## Build instructions
 
 1. `npm i`
-2. `cargo tauri build`
+2. `npm run fetch-esptool` (downloads esptool 5.3.1 into src-tauri/binaries, needed before every build on a new machine)
+3. `npx tauri build`
