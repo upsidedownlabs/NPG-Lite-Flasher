@@ -1,8 +1,416 @@
-use espflash::{flasher::Flasher, interface::Interface};
+use serde::{Deserialize, Serialize};
 use serialport;
-use tauri::Manager;
+use std::collections::BTreeMap;
 use std::fs;
-use tauri_plugin_shell;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Duration;
+use tauri::{Emitter, Manager};
+use tauri_plugin_shell::{self, process::CommandEvent, ShellExt};
+
+// ---------------------------------------------------------------------------
+// Firmware sources: GitHub releases, served through each repo's Cloudflare Worker
+// (same endpoints as the web flasher).
+// ---------------------------------------------------------------------------
+
+const CHORDS_REPO: &str = "upsidedownlabs/Chords-Arduino-Firmware";
+const CHORDS_WORKER: &str = "https://chords-arduino-firmware.myupsidedownlab.workers.dev";
+const PROJECTS_REPO: &str = "upsidedownlabs/NPG-Lite-Arduino-Firmware";
+const PROJECTS_WORKER: &str = "https://npg-flasher-web.myupsidedownlab.workers.dev";
+
+/// (kind shown in the UI, release asset name)
+const CHORDS_FILES: [(&str, &str); 3] = [
+    ("BLE", "Chords-NPG-LITE-BLE-ESP32C6.merged.bin"),
+    ("Serial", "Chords-NPG-LITE-Serial-ESP32C6.merged.bin"),
+    ("WiFi", "Chords-NPG-LITE-WiFi-ESP32C6.merged.bin"),
+];
+
+/// Merged images cover the whole 4 MB flash: bootloader image at 0x0, app image at 0x10000.
+const MERGED_IMAGE_SIZE: usize = 4 * 1024 * 1024;
+const APP_IMAGE_OFFSET: usize = 0x10000;
+const ESP_IMAGE_MAGIC: u8 = 0xE9;
+/// Chip ID in the ESP image header (u16 little-endian at offset 12). 13 = ESP32-C6.
+const ESP32C6_CHIP_ID: u16 = 13;
+const NOT_MERGED_C6_IMAGE: &str =
+    "This file is not an ESP32-C6 merged firmware image (*.merged.bin, 4 MB). It cannot be flashed.";
+const HTTP_USER_AGENT: &str = "NPG-Lite-Flasher";
+
+/// Accepts only a 4 MB ESP32-C6 merged image: an ESP32-C6 bootloader image at 0x0
+/// and an ESP32-C6 app image at 0x10000.
+fn check_merged_c6_image(data: &[u8]) -> Result<(), String> {
+    let c6_image_at = |offset: usize| {
+        data.len() >= offset + 14
+            && data[offset] == ESP_IMAGE_MAGIC
+            && u16::from_le_bytes([data[offset + 12], data[offset + 13]]) == ESP32C6_CHIP_ID
+    };
+
+    if data.len() == MERGED_IMAGE_SIZE && c6_image_at(0) && c6_image_at(APP_IMAGE_OFFSET) {
+        Ok(())
+    } else {
+        Err(NOT_MERGED_C6_IMAGE.to_string())
+    }
+}
+
+#[derive(Deserialize)]
+struct WorkerAsset {
+    name: String,
+    url: String,
+}
+
+#[derive(Deserialize)]
+struct WorkerLatest {
+    tag: String,
+    assets: Option<Vec<WorkerAsset>>,
+}
+
+struct LatestRelease {
+    tag: String,
+    /// (asset name, download url)
+    assets: Vec<(String, String)>,
+}
+
+impl LatestRelease {
+    fn asset_url(&self, name: &str) -> Option<&str> {
+        self.assets
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, url)| url.as_str())
+    }
+}
+
+/// Latest release of `repo`: the Worker's /latest first, GitHub's API as fallback.
+/// Returns None when neither answers (offline).
+async fn latest_release(repo: &str, worker: &str) -> Option<LatestRelease> {
+    let client = reqwest::Client::builder()
+        .user_agent(HTTP_USER_AGENT)
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok()?;
+
+    if let Ok(resp) = client.get(format!("{}/latest", worker)).send().await {
+        if resp.status().is_success() {
+            if let Ok(latest) = resp.json::<WorkerLatest>().await {
+                if let Some(assets) = latest.assets {
+                    if !latest.tag.is_empty() {
+                        let assets = assets
+                            .into_iter()
+                            .map(|a| {
+                                let url = if a.url.starts_with("http://") || a.url.starts_with("https://") {
+                                    a.url
+                                } else if a.url.starts_with('/') {
+                                    format!("{}{}", worker, a.url)
+                                } else {
+                                    format!("{}/{}", worker, a.url)
+                                };
+                                (a.name, url)
+                            })
+                            .collect();
+                        return Some(LatestRelease { tag: latest.tag, assets });
+                    }
+                }
+            }
+        }
+    }
+
+    let resp = client
+        .get(format!("https://api.github.com/repos/{}/releases/latest", repo))
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let release: serde_json::Value = resp.json().await.ok()?;
+    let tag = release["tag_name"].as_str()?.to_string();
+    let assets = release["assets"]
+        .as_array()?
+        .iter()
+        .filter_map(|asset| {
+            let name = asset["name"].as_str()?.to_string();
+            let url = format!("{}/firmware/{}/{}", worker, tag, name);
+            Some((name, url))
+        })
+        .collect();
+    Some(LatestRelease { tag, assets })
+}
+
+/// Downloads a merged firmware image to `dest`. The file is only replaced when the
+/// download is complete and looks like a 4 MB ESP image.
+async fn download_firmware(url: &str, dest: &Path) -> Result<(), String> {
+    let file_name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| format!("Invalid firmware path {:?}", dest))?;
+
+    let client = reqwest::Client::builder()
+        .user_agent(HTTP_USER_AGENT)
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to download {}: {}", file_name, e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("Failed to download {}: server returned {}", file_name, status));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed to download {}: {}", file_name, e))?;
+
+    check_merged_c6_image(&bytes).map_err(|e| format!("Downloaded {}: {}", file_name, e))?;
+
+    let dir = dest
+        .parent()
+        .ok_or_else(|| format!("Invalid firmware path {:?}", dest))?;
+    fs::create_dir_all(dir).map_err(|e| format!("Failed to create {:?}: {}", dir, e))?;
+
+    // Write next to the target, then rename, so a failed write never replaces a good file.
+    let tmp = dir.join(format!("{}.part", file_name));
+    if let Err(e) = fs::write(&tmp, &bytes) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("Failed to save {}: {}", file_name, e));
+    }
+    if let Err(e) = fs::rename(&tmp, dest) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("Failed to save {}: {}", file_name, e));
+    }
+    Ok(())
+}
+
+/// Rejects names that could escape the firmware folder.
+fn is_plain_file_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains('/') && !name.contains('\\') && name != "." && name != ".."
+}
+
+fn app_files_path(app: &tauri::AppHandle, relative: &str) -> Result<PathBuf, String> {
+    app.path()
+        .resolve(format!("files/{}", relative), tauri::path::BaseDirectory::AppData)
+        .map_err(|e| format!("Failed to resolve files/{}: {}", relative, e))
+}
+
+// ---------------------------------------------------------------------------
+// files/firmware-versions.json: "chords/<file>" or "custom/<file>" -> release tag
+// ---------------------------------------------------------------------------
+
+type Versions = BTreeMap<String, String>;
+
+static VERSIONS_LOCK: Mutex<()> = Mutex::new(());
+
+fn read_versions(path: &Path) -> Versions {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn load_versions(app: &tauri::AppHandle) -> Versions {
+    let _guard = VERSIONS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    app_files_path(app, "firmware-versions.json")
+        .map(|p| read_versions(&p))
+        .unwrap_or_default()
+}
+
+fn update_versions(app: &tauri::AppHandle, change: impl FnOnce(&mut Versions)) -> Result<(), String> {
+    let _guard = VERSIONS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = app_files_path(app, "firmware-versions.json")?;
+    let mut versions = read_versions(&path);
+    change(&mut versions);
+
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("Failed to create {:?}: {}", dir, e))?;
+    }
+    let json = serde_json::to_string_pretty(&versions)
+        .map_err(|e| format!("Failed to encode firmware versions: {}", e))?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, json).map_err(|e| format!("Failed to save firmware versions: {}", e))?;
+    fs::rename(&tmp, &path).map_err(|e| format!("Failed to save firmware versions: {}", e))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Chords firmware (BLE / Serial / WiFi), kept in AppData/files/chords/
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChordsFirmwareStatus {
+    kind: String,
+    file: String,
+    available: bool,
+    tag: Option<String>,
+    /// Was missing and has just been downloaded.
+    downloaded: bool,
+    /// Existed and has just been replaced by a newer release.
+    updated: bool,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChordsSyncResult {
+    online: bool,
+    latest_tag: Option<String>,
+    firmwares: Vec<ChordsFirmwareStatus>,
+}
+
+/// Only one Chords sync at a time, so two calls never download the same file together.
+static CHORDS_SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[tauri::command]
+async fn sync_chords_firmwares(app: tauri::AppHandle) -> Result<ChordsSyncResult, String> {
+    let _sync = CHORDS_SYNC_LOCK.lock().await;
+    let dir = app_files_path(&app, "chords")?;
+    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create {:?}: {}", dir, e))?;
+
+    let latest = latest_release(CHORDS_REPO, CHORDS_WORKER).await;
+    let versions = load_versions(&app);
+    let mut firmwares = Vec::new();
+
+    for (kind, file) in CHORDS_FILES {
+        let path = dir.join(file);
+        let key = format!("chords/{}", file);
+        let exists = path.is_file();
+        let saved_tag = versions.get(&key).cloned();
+
+        let mut status = ChordsFirmwareStatus {
+            kind: kind.to_string(),
+            file: file.to_string(),
+            available: exists,
+            tag: saved_tag.clone(),
+            downloaded: false,
+            updated: false,
+            error: None,
+        };
+
+        // Offline: keep whatever is saved.
+        if let Some(release) = &latest {
+            if !exists || saved_tag.as_deref() != Some(release.tag.as_str()) {
+                match release.asset_url(file) {
+                    None => {
+                        status.error = Some(format!("{} is not in Chords release {}", file, release.tag));
+                    }
+                    Some(url) => match download_firmware(url, &path).await {
+                        Ok(()) => {
+                            status.available = true;
+                            status.tag = Some(release.tag.clone());
+                            if exists {
+                                status.updated = true;
+                            } else {
+                                status.downloaded = true;
+                            }
+                            if let Err(e) = update_versions(&app, |v| {
+                                v.insert(key.clone(), release.tag.clone());
+                            }) {
+                                status.error = Some(e);
+                            }
+                        }
+                        Err(e) => status.error = Some(e),
+                    },
+                }
+            }
+        }
+
+        firmwares.push(status);
+    }
+
+    Ok(ChordsSyncResult {
+        online: latest.is_some(),
+        latest_tag: latest.map(|r| r.tag),
+        firmwares,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Project firmware (NPG-Lite-Arduino-Firmware), saved in AppData/files/custom/
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectFirmwareList {
+    tag: String,
+    /// [name, url] pairs, as the UI already uses them.
+    firmwares: Vec<(String, String)>,
+}
+
+#[tauri::command]
+async fn list_project_firmwares() -> Result<ProjectFirmwareList, String> {
+    let release = latest_release(PROJECTS_REPO, PROJECTS_WORKER)
+        .await
+        .ok_or("Could not reach the firmware server. Check your internet connection.")?;
+
+    let firmwares: Vec<(String, String)> = release
+        .assets
+        .into_iter()
+        .filter(|(name, _)| name.ends_with(".ino.merged.bin"))
+        .collect();
+
+    if firmwares.is_empty() {
+        return Err(format!("No .ino.merged.bin files found in release {}", release.tag));
+    }
+
+    Ok(ProjectFirmwareList { tag: release.tag, firmwares })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectUpdate {
+    /// "updated", "upToDate", "offline", "untracked", "notInRelease" or "failed"
+    status: &'static str,
+    tag: Option<String>,
+    previous_tag: Option<String>,
+    error: Option<String>,
+}
+
+#[tauri::command]
+async fn ensure_latest_project(app: tauri::AppHandle, name: String) -> Result<ProjectUpdate, String> {
+    if !is_plain_file_name(&name) {
+        return Err(format!("Invalid firmware name: {}", name));
+    }
+    let key = format!("custom/{}", name);
+    let previous_tag = load_versions(&app).get(&key).cloned();
+
+    let result = |status, tag: Option<String>, error: Option<String>| ProjectUpdate {
+        status,
+        tag,
+        previous_tag: previous_tag.clone(),
+        error,
+    };
+
+    // No recorded tag: a user upload. Leave it alone.
+    let Some(saved_tag) = previous_tag.clone() else {
+        return Ok(result("untracked", None, None));
+    };
+
+    let Some(release) = latest_release(PROJECTS_REPO, PROJECTS_WORKER).await else {
+        return Ok(result("offline", Some(saved_tag), None));
+    };
+
+    if release.tag == saved_tag {
+        return Ok(result("upToDate", Some(saved_tag), None));
+    }
+
+    let Some(url) = release.asset_url(&name) else {
+        return Ok(result("notInRelease", Some(saved_tag), None));
+    };
+
+    let path = app_files_path(&app, "custom")?.join(&name);
+    if let Err(e) = download_firmware(url, &path).await {
+        return Ok(result("failed", Some(saved_tag), Some(e)));
+    }
+    if let Err(e) = update_versions(&app, |v| {
+        v.insert(key.clone(), release.tag.clone());
+    }) {
+        return Ok(result("failed", Some(saved_tag), Some(e)));
+    }
+
+    Ok(result("updated", Some(release.tag), None))
+}
 
 #[tauri::command]
 fn list_serial_ports() -> Vec<String> {
@@ -52,122 +460,225 @@ async fn save_custom_firmware(app: tauri::AppHandle, name: String, data: Vec<u8>
     let firmware_dir = app.path()
         .resolve("files/custom", tauri::path::BaseDirectory::AppData)
         .map_err(|e| format!("Failed to resolve custom firmware path: {}", e))?;
-    
+
     // Ensure the filename ends with .bin
     let filename = if name.ends_with(".bin") {
         name
     } else {
         format!("{}.bin", name)
     };
-    
+    if !is_plain_file_name(&filename) {
+        return Err(format!("Invalid firmware name: {}", filename));
+    }
+
+    // Reject anything that is not an ESP32-C6 merged image; nothing is saved.
+    check_merged_c6_image(&data)?;
+
     let path = firmware_dir.join(&filename);
-    
+
+    fs::create_dir_all(&firmware_dir)
+        .map_err(|e| format!("Failed to create custom firmware directory: {}", e))?;
     fs::write(&path, &data)
         .map_err(|e| format!("Failed to save firmware {}: {}", filename, e))?;
-    
+
+    // A user upload has no release tag; drop any tag left by a downloaded file of the
+    // same name so ensure_latest_project never overwrites the upload.
+    update_versions(&app, |v| {
+        v.remove(&format!("custom/{}", filename));
+    })?;
+
     Ok(filename)
+}
+
+/// Short status for the Flash button, from one line of esptool output.
+/// Keep these short: the button has a fixed width.
+fn flash_stage(line: &str) -> Option<String> {
+    let l = line.trim().to_ascii_lowercase();
+    if l.contains("hard resetting") {
+        Some("Restarting...".to_string())
+    } else if l.contains("hash of data verified") {
+        Some("Verified".to_string())
+    } else if l.starts_with("wrote ") {
+        Some("Verifying...".to_string())
+    } else if l.starts_with("writing at") {
+        Some(match percent_in(&l) {
+            Some(p) => format!("Flashing {}%", p),
+            None => "Flashing...".to_string(),
+        })
+    } else if l.contains("stub")
+        || l.contains("changing baud")
+        || l.contains("configuring flash")
+        || l.contains("will be erased")
+        || l.starts_with("compressed ")
+    {
+        Some("Preparing...".to_string())
+    } else if l.starts_with("connecting") {
+        Some("Connecting...".to_string())
+    } else {
+        None
+    }
+}
+
+/// The number just before the first '%' in `line`, e.g. "... 42.5% ..." or "(42 %)" -> 42.
+fn percent_in(line: &str) -> Option<u32> {
+    let before = line[..line.find('%')?].trim_end();
+    let start = before
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| c.is_ascii_digit() || *c == '.')
+        .last()
+        .map(|(i, _)| i)?;
+    before[start..].parse::<f32>().ok().map(|p| p.round().min(100.0) as u32)
+}
+
+/// The bundled esptool. Installed apps have it next to the app executable (Tauri sidecar).
+/// In development builds it may be missing there: with Cargo's newer build-dir layout,
+/// tauri-build copies the sidecar into target/<profile>/build/ instead, so fall back to
+/// the file downloaded by `npm run fetch-esptool`.
+fn esptool_command(app: &tauri::AppHandle) -> Result<tauri_plugin_shell::process::Command, String> {
+    let exe_name = format!("npg-esptool{}", std::env::consts::EXE_SUFFIX);
+    let next_to_app = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(&exe_name)));
+    if next_to_app.as_deref().is_some_and(Path::is_file) {
+        return app
+            .shell()
+            .sidecar("npg-esptool")
+            .map_err(|e| format!("Could not start the bundled esptool: {}", e));
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        let dev_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries").join(format!(
+            "npg-esptool-{}{}",
+            env!("TAURI_ENV_TARGET_TRIPLE"),
+            std::env::consts::EXE_SUFFIX
+        ));
+        if dev_path.is_file() {
+            return Ok(app.shell().command(dev_path));
+        }
+    }
+
+    Err(format!(
+        "The bundled esptool ({}) was not found next to the app. Please reinstall the app.",
+        exe_name
+    ))
 }
 
 #[tauri::command]
 async fn flash_firmware(app: tauri::AppHandle, portname: String, file: String, iscustom: bool) -> Result<String, String> {
-    tokio::task::spawn_blocking(move || {
-        use std::{fs::File, io::Read, thread::sleep, time::Duration};
+    if !is_plain_file_name(&file) {
+        return Err(format!("Invalid firmware name: {}", file));
+    }
 
-        let read_bin = |path: &std::path::Path| -> Result<Vec<u8>, String> {
-            let mut file = File::open(path).map_err(|e| format!("Failed to open {:?}: {}", path, e))?;
-            let mut buffer = Vec::new();
-            file.read_to_end(&mut buffer)
-                .map_err(|e| format!("Failed to read {:?}: {}", path, e))?;
-            if buffer.is_empty() {
-                return Err(format!("File {:?} is empty", path));
-            }
-            Ok(buffer)
-        };
+    let firmware_path = if iscustom {
+        app.path()
+            .resolve(&format!("files/custom/{}", file), tauri::path::BaseDirectory::AppData)
+            .map_err(|e| format!("Failed to resolve custom firmware path: {}", e))?
+    } else {
+        app.path()
+            .resolve(&format!("files/chords/{}", file), tauri::path::BaseDirectory::AppData)
+            .map_err(|e| format!("Failed to resolve Chords firmware path: {}", e))?
+    };
 
-        let resource_path = if iscustom {
-            app.path()
-                .resolve(&format!("files/custom/{}", file), tauri::path::BaseDirectory::AppData)
-                .map_err(|e| format!("Failed to resolve custom firmware path: {}", e))?
-        } else {
-            app.path()
-                .resolve(&format!("files/{}", file), tauri::path::BaseDirectory::Resource)
-                .map_err(|e| format!("Failed to resolve resource path: {}", e))?
-        };
+    let data = fs::read(&firmware_path)
+        .map_err(|e| format!("Failed to read {:?}: {}", firmware_path, e))?;
+    check_merged_c6_image(&data)?;
+    drop(data);
 
-        let app = read_bin(&resource_path)?;
+    let firmware_arg = firmware_path.to_string_lossy().into_owned();
 
-        let ports = serialport::available_ports().map_err(|e| {
-            format!("Failed to list ports: {}. Try 'sudo usermod -a -G dialout $USER' and reboot", e)
-        })?;
+    // Arduino IDE's upload command for ESP32-C6, writing the merged image at 0x0.
+    let (mut events, _child) = esptool_command(&app)?
+        .args([
+            "--chip", "esp32c6",
+            "--port", portname.as_str(),
+            "--baud", "921600",
+            "--before", "default-reset",
+            "--after", "hard-reset",
+            "write-flash",
+            "-z",
+            "--flash-mode", "keep",
+            "--flash-freq", "keep",
+            "--flash-size", "keep",
+            "0x0", firmware_arg.as_str(),
+        ])
+        // esptool is a Python program: write UTF-8 so its output always decodes, and
+        // don't buffer it, so progress reaches the app while flashing.
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUNBUFFERED", "1")
+        .spawn()
+        .map_err(|e| format!("Could not run esptool: {}", e))?;
 
-        let port_info = ports
-            .iter()
-            .find(|p| p.port_name == portname)
-            .ok_or_else(|| {
-                let available = ports.iter().map(|p| &p.port_name).collect::<Vec<_>>();
-                format!("Port {} not found. Available ports: {:?}", portname, available)
-            })?;
-
-        let usb_info = match &port_info.port_type {
-            serialport::SerialPortType::UsbPort(info) => info,
-            _ => return Err(format!("Port {} is not a USB port", portname)),
-        };
-
-        println!("Connecting to interface...");
-        let interface = (0..3)
-            .find_map(|attempt| {
-                let result = Interface::new(&port_info.clone(), Some(1), Some(1))
-                    .map_err(|e| format!("Attempt {}: {}", attempt + 1, e));
-                if result.is_ok() || attempt == 2 {
-                    Some(result)
-                } else {
-                    sleep(Duration::from_millis(500));
-                    None
-                }
-            })
-            .unwrap_or_else(|| Err("Failed to create interface after 3 attempts".into()))?;
-
-        let mut flasher = Flasher::connect(interface, usb_info.clone(), Some(921600), false)
-            .map_err(|e| format!("Failed to connect to device: {}", e))?;
-
-        fn retry_flash(
-            flasher: &mut Flasher,
-            addr: u32,
-            data: &[u8],
-            name: &str,
-        ) -> Result<(), String> {
-            for i in 0..5 {
-                match flasher.write_bin_to_flash(addr, data, None) {
-                    Ok(_) => {
-                        println!("{} flashed successfully (attempt {}).", name, i + 1);
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        if i == 4 {
-                            return Err(format!(
-                                "{} flash failed at 0x{:X} ({} bytes): {}",
-                                name, addr, data.len(), e
-                            ));
-                        }
-                        println!("Retrying {} flash (attempt {})...", name, i + 2);
-                        sleep(Duration::from_millis(500));
+    // Read esptool's output as it arrives and tell the UI which stage it is in.
+    let mut combined = String::new();
+    let mut exit_code: Option<i32> = None;
+    let mut last_stage = String::new();
+    while let Some(event) = events.recv().await {
+        match event {
+            CommandEvent::Stdout(bytes) | CommandEvent::Stderr(bytes) => {
+                let line = String::from_utf8_lossy(&bytes);
+                combined.push_str(&line);
+                combined.push('\n');
+                if let Some(stage) = flash_stage(&line) {
+                    if stage != last_stage {
+                        let _ = app.emit("flash-progress", &stage);
+                        last_stage = stage;
                     }
                 }
             }
-            Err(format!("{} flash failed after 5 retries", name))
+            CommandEvent::Error(e) => {
+                combined.push_str(&e);
+                combined.push('\n');
+            }
+            CommandEvent::Terminated(payload) => exit_code = payload.code,
+            _ => {}
         }
+    }
 
-        println!("Flashing application...");
-        retry_flash(&mut flasher, 0x10000, &app, "Application")?;
-        sleep(Duration::from_millis(500));
+    println!("---- esptool (exit code {:?}) ----", exit_code);
+    println!("{}", combined.trim_end());
+    println!("---- end of esptool output ----");
 
-        Ok("✅ Firmware flashed successfully! The device should now reboot.".to_string())
-    })
-    .await
-    .map_err(|e| format!("Thread error: {:?}", e))?
+    match exit_code {
+        Some(0) if combined.contains("Hash of data verified") => {
+            // With --after hard-reset, esptool has already restarted the board when it exits.
+            // That restart cannot leave download mode if it was entered by holding BOOT while
+            // plugging in (the chip only reads BOOT at power-up), and esptool's output looks
+            // the same in that case, so always tell the user how to recover.
+            if combined.to_ascii_lowercase().contains("hard resetting") {
+                Ok("Firmware flashed and verified. The board has been restarted with the new firmware.\n\
+                    If it does not start (for example, because BOOT was held while plugging it in), \
+                    unplug the board and plug it back in."
+                    .to_string())
+            } else {
+                Ok("Firmware flashed and verified. Unplug and replug the board to start it.".to_string())
+            }
+        }
+        Some(0) => Err(
+            "esptool finished but did not confirm that the written data was verified \
+             (no \"Hash of data verified\" in its output). Please flash again."
+                .to_string(),
+        ),
+        code => {
+            let lines: Vec<&str> = combined
+                .split(|c| c == '\n' || c == '\r')
+                .map(str::trim_end)
+                .filter(|line| !line.trim().is_empty())
+                .collect();
+            let tail = lines[lines.len().saturating_sub(15)..].join("\n");
+            let code = code.map_or_else(|| "none".to_string(), |c| c.to_string());
+            Err(format!("Flashing failed (esptool exit code {}):\n{}", code, tail))
+        }
+    }
 }
+
 #[tauri::command]
 async fn delete_custom_firmware(app: tauri::AppHandle, filename: String) -> Result<String, String> {
+    if !is_plain_file_name(&filename) {
+        return Err(format!("Invalid firmware name: {}", filename));
+    }
+
     let firmware_dir = app.path()
         .resolve("files/custom", tauri::path::BaseDirectory::AppData)
         .map_err(|e| format!("Failed to resolve custom firmware path: {}", e))?;
@@ -180,71 +691,29 @@ async fn delete_custom_firmware(app: tauri::AppHandle, filename: String) -> Resu
     
     std::fs::remove_file(&path)
         .map_err(|e| format!("Failed to delete firmware {}: {}", filename, e))?;
-    
+
+    // The file is gone either way; a stale entry would only be cosmetic, so just log it.
+    if let Err(e) = update_versions(&app, |v| {
+        v.remove(&format!("custom/{}", filename));
+    }) {
+        eprintln!("Deleted {} but could not update firmware versions: {}", filename, e);
+    }
+
     Ok(format!("Firmware {} deleted successfully", filename))
 }
 
 #[tauri::command]
-async fn fetch_github_releases(repo: String) -> Result<Vec<(String, String)>, String> {
-    let client = reqwest::Client::new();
-    let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
-    
-    let response = client
-        .get(&url)
-        .header("User-Agent", "Tauri App")
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch releases: {}", e))?;
-    
-    if !response.status().is_success() {
-        return Err(format!("GitHub API returned status: {}", response.status()));
+async fn download_and_save_firmware(app: tauri::AppHandle, url: String, name: String, tag: String) -> Result<String, String> {
+    if !is_plain_file_name(&name) {
+        return Err(format!("Invalid firmware name: {}", name));
     }
-    
-    let release: serde_json::Value = response.json()
-        .await
-        .map_err(|e| format!("Failed to parse response: {}", e))?;
-    
-    let assets = release["assets"].as_array()
-        .ok_or("No assets found in release")?;
-    
-    let firmwares: Vec<(String, String)> = assets.iter()
-        .filter_map(|asset| {
-            let name = asset["name"].as_str()?.to_string();
-            if name.ends_with(".bin") {
-                Some((name, asset["browser_download_url"].as_str()?.to_string()))
-            } else {
-                None
-            }
-        })
-        .collect();
-    
-    if firmwares.is_empty() {
-        return Err("No .bin files found in release assets".into());
-    }
-    
-    Ok(firmwares)
-}
-#[tauri::command]
-async fn download_and_save_firmware(app: tauri::AppHandle, url: String, name: String) -> Result<String, String> {
-    let client = reqwest::Client::new();
-    let response = client
-        .get(&url)
-        .header("User-Agent", "Tauri App")
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch firmware: {}", e))?;
 
-    let bytes = response.bytes().await.map_err(|e| format!("Failed to read response body: {}", e))?;
+    let file_path = app_files_path(&app, "custom")?.join(&name);
+    download_firmware(&url, &file_path).await?;
 
-    let firmware_dir = app.path()
-        .resolve("files/custom", tauri::path::BaseDirectory::AppData)
-        .map_err(|e| format!("Failed to resolve custom firmware path: {}", e))?;
-
-    // Create the directory if it doesn't exist
-    std::fs::create_dir_all(&firmware_dir).map_err(|e| format!("Failed to create firmware directory: {}", e))?;
-
-    let file_path = firmware_dir.join(&name);
-    std::fs::write(&file_path, bytes).map_err(|e| format!("Failed to write firmware file: {}", e))?;
+    update_versions(&app, |v| {
+        v.insert(format!("custom/{}", name), tag.clone());
+    })?;
 
     Ok(name)
 }
@@ -252,13 +721,15 @@ async fn download_and_save_firmware(app: tauri::AppHandle, url: String, name: St
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
-            fetch_github_releases,
+            sync_chords_firmwares,
+            list_project_firmwares,
+            ensure_latest_project,
             download_and_save_firmware,
-            list_serial_ports, 
+            list_serial_ports,
             flash_firmware,
             list_custom_firmwares,
             save_custom_firmware,
-            delete_custom_firmware  // Add this line
+            delete_custom_firmware
         ])
         .plugin(tauri_plugin_shell::init())
         .run(tauri::generate_context!())

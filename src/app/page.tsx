@@ -1,18 +1,78 @@
 "use client"
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { core } from "@tauri-apps/api";
+import { listen } from "@tauri-apps/api/event";
 import { AlertCircle, CheckCircle, Cpu, Wifi, Bluetooth, Usb, ArrowRight, RefreshCw, X, Plus, Upload, Trash2, Download, Github } from "lucide-react";
 type FirmwareFile = [string, string]; // [name, url]
 import Link from "next/link";
 import { open } from '@tauri-apps/plugin-shell';
 
+// Chords firmware: merged images from upsidedownlabs/Chords-Arduino-Firmware releases,
+// kept up to date in AppData/files/chords/ by sync_chords_firmwares.
+const CHORDS_FILES: Record<string, string> = {
+  BLE: "Chords-NPG-LITE-BLE-ESP32C6.merged.bin",
+  Serial: "Chords-NPG-LITE-Serial-ESP32C6.merged.bin",
+  WiFi: "Chords-NPG-LITE-WiFi-ESP32C6.merged.bin",
+};
+const CHORDS_CHECKING_NOTICE = 'Checking for the latest Chords firmware...';
+const CHORDS_STILL_CHECKING_ERROR = 'Error: Still checking for the latest Chords firmware. Please try again in a moment.';
+
+type ChordsFirmwareStatus = {
+  kind: string;
+  file: string;
+  available: boolean;
+  tag: string | null;
+  downloaded: boolean;
+  updated: boolean;
+  error: string | null;
+};
+type ChordsSyncResult = { online: boolean; latestTag: string | null; firmwares: ChordsFirmwareStatus[] };
+type ProjectFirmwareList = { tag: string; firmwares: FirmwareFile[] };
+type ProjectUpdate = {
+  status: "updated" | "upToDate" | "offline" | "untracked" | "notInRelease" | "failed";
+  tag: string | null;
+  previousTag: string | null;
+  error: string | null;
+};
+
+// One sync per page load, even though React Strict Mode runs effects twice in development.
+let chordsSyncPromise: Promise<ChordsSyncResult> | null = null;
+const syncChordsOnce = () => {
+  chordsSyncPromise ??= core.invoke<ChordsSyncResult>("sync_chords_firmwares");
+  return chordsSyncPromise;
+};
+
+const describeChordsSync = (result: ChordsSyncResult): string => {
+  const available = result.firmwares.filter(f => f.available);
+  const errors = result.firmwares.filter(f => f.error).map(f => `${f.kind}: ${f.error}`);
+  const withErrors = (line: string) => (errors.length ? `${line}\n${errors.join("\n")}` : line);
+
+  if (available.length === 0) {
+    return withErrors("Chords firmware not downloaded yet. Connect to the internet and restart the app.");
+  }
+
+  const tags = [...new Set(available.map(f => f.tag ?? "unknown version"))].join(", ");
+  let line: string;
+  if (!result.online) line = `Offline: using saved Chords firmware (${tags})`;
+  else if (available.some(f => f.updated)) line = `Updated Chords firmware to ${tags}`;
+  else if (available.some(f => f.downloaded)) line = `Downloaded Chords firmware (${tags})`;
+  else line = `Chords firmware ready (${tags})`;
+
+  const missing = result.firmwares.filter(f => !f.available).map(f => f.kind);
+  if (missing.length) line += `. Not available yet: ${missing.join(", ")}`;
+  return withErrors(line);
+};
+
 export default function Home() {
   const [ports, setPorts] = useState<string[]>([]);
   const [selectedPort, setSelectedPort] = useState('');
   const [output, setOutput] = useState('');
+  const outputRef = useRef(output); // latest output, read by the async Chords check
+  outputRef.current = output;
   const [firmwareType, setFirmwareType] = useState('');
   const [showPopover, setShowPopover] = useState(false);
   const [isFlashing, setIsFlashing] = useState(false);
+  const [flashStage, setFlashStage] = useState(''); // live status from esptool, shown on the Flash button
   const [flashStatus, setFlashStatus] = useState(''); // 'success', 'error', or ''
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [customFirmwares, setCustomFirmwares] = useState<string[]>([]);
@@ -23,7 +83,9 @@ export default function Home() {
   const [showGithubDialog, setShowGithubDialog] = useState(false);
   const [githubFirmwares, setGithubFirmwares] = useState<FirmwareFile[]>([]);
   const [isFetchingGithub, setIsFetchingGithub] = useState(false);
-  const githubRepo = "upsidedownlabs/npg-lite-firmware";
+  const [githubTag, setGithubTag] = useState('');
+  const [chordsSync, setChordsSync] = useState<ChordsSyncResult | null>(null);
+  const [chordsNotice, setChordsNotice] = useState(CHORDS_CHECKING_NOTICE);
   const [downloadingFirmware, setDownloadingFirmware] = useState<string | null>(null);
   const [downloadedFirmwares, setDownloadedFirmwares] = useState<string[]>([]);
   const [flashFromUpload, setFlashFromUpload] = useState(false);
@@ -38,9 +100,44 @@ export default function Home() {
     // Initial load
     refreshPorts();
     loadCustomFirmwares();
+    syncChordsFirmwares();
 
     return () => clearInterval(pollInterval); // Cleanup on unmount
   }, []);
+
+  // Live flashing stage sent by flash_firmware ("Connecting...", "Flashing... 42%", ...).
+  useEffect(() => {
+    let stopListening: (() => void) | undefined;
+    let cancelled = false;
+    listen<string>("flash-progress", (event) => setFlashStage(event.payload)).then((unlisten) => {
+      if (cancelled) unlisten();
+      else stopListening = unlisten;
+    });
+    return () => {
+      cancelled = true;
+      stopListening?.();
+    };
+  }, []);
+
+  const syncChordsFirmwares = async () => {
+    let notice: string;
+    try {
+      const result = await syncChordsOnce();
+      setChordsSync(result);
+      notice = describeChordsSync(result);
+    } catch (err) {
+      console.error("Error syncing Chords firmware:", err);
+      setChordsSync({ online: false, latestTag: null, firmwares: [] });
+      notice = `Could not prepare Chords firmware: ${String(err)}`;
+    }
+    console.log(notice);
+    setChordsNotice(notice);
+    // Replace only our own "checking" text, never another message, and drop the error styling with it.
+    if (outputRef.current === CHORDS_CHECKING_NOTICE || outputRef.current === CHORDS_STILL_CHECKING_ERROR) {
+      setOutput(notice);
+      setFlashStatus('');
+    }
+  };
 
   const refreshPorts = async () => {
     setIsRefreshing(true);
@@ -66,10 +163,9 @@ export default function Home() {
   const fetchGithubReleases = async () => {
     setIsFetchingGithub(true);
     try {
-      const releases = await core.invoke<FirmwareFile[]>("fetch_github_releases", {
-        repo: githubRepo
-      });
-      setGithubFirmwares(releases);
+      const release = await core.invoke<ProjectFirmwareList>("list_project_firmwares");
+      setGithubFirmwares(release.firmwares);
+      setGithubTag(release.tag);
       setShowGithubDialog(true);
     } catch (err) {
       console.error("Error fetching GitHub releases:", err);
@@ -96,7 +192,8 @@ export default function Home() {
 
       const downloadedName = await core.invoke<string>("download_and_save_firmware", {
         url,
-        name
+        name,
+        tag: githubTag
       });
 
       await loadCustomFirmwares();
@@ -119,7 +216,7 @@ export default function Home() {
     if (type) {
       setShowPopover(true);
       setFlashStatus('');
-      setOutput('');
+      setOutput(CHORDS_FILES[type] ? chordsNotice : '');
     }
   };
 
@@ -135,24 +232,48 @@ export default function Home() {
     let file = "";
     let isCustom = false;
 
-    switch (firmwareToFlash) {
-      case "BLE":
-        file = "/NPG-LITE-BLE.ino.bin";
-        break;
-      case "Serial":
-        file = "/NPG-LITE.ino.bin";
-        break;
-      case "WiFi":
-        file = "/NPG-LITE-WiFi.ino.bin";
-        break;
-      default:
-        file = firmwareToFlash;
-        isCustom = true;
+    const chordsFile = CHORDS_FILES[firmwareToFlash];
+    if (chordsFile) {
+      if (!chordsSync) {
+        setOutput(CHORDS_STILL_CHECKING_ERROR);
+        setFlashStatus('error');
+        return;
+      }
+      const status = chordsSync.firmwares.find(f => f.file === chordsFile);
+      if (!status?.available) {
+        setOutput(`Error: Chords ${firmwareToFlash} firmware is not downloaded yet. Connect to the internet and restart the app.`);
+        setFlashStatus('error');
+        return;
+      }
+      file = chordsFile;
+    } else {
+      file = firmwareToFlash;
+      isCustom = true;
     }
 
     setIsFlashing(true);
-    setOutput("Flashing firmware, please wait...");
     setFlashStatus('');
+    setFlashStage('');
+
+    // Notes shown above the flash result, e.g. that a project firmware was just updated.
+    let notes = "";
+    if (isCustom) {
+      setFlashStage("Checking...");
+      setOutput("Checking for firmware updates...");
+      try {
+        const update = await core.invoke<ProjectUpdate>("ensure_latest_project", { name: file });
+        if (update.status === "updated") {
+          notes = `Updated ${file} from ${update.previousTag} to ${update.tag}.\n`;
+        } else if (update.status === "failed") {
+          notes = `Could not update ${file}: ${update.error}. Flashing the saved copy.\n`;
+        }
+      } catch (err) {
+        notes = `Could not check for updates: ${String(err)}\n`;
+      }
+    }
+
+    setFlashStage("Connecting...");
+    setOutput(`${notes}Flashing firmware, please wait...`);
 
     try {
       const result = await core.invoke("flash_firmware", {
@@ -160,16 +281,17 @@ export default function Home() {
         file: file,
         iscustom: isCustom
       });
-      setOutput(`Success: ${String(result)}`);
+      setOutput(`${notes}Success: ${String(result)}`);
       setFlashStatus('success');
       setIsFlashed(true);
     } catch (err) {
       console.error("Flash failed:", err);
-      setOutput(`Error: ${String(err)}`);
+      setOutput(`${notes}Error: ${String(err)}`);
       setFlashStatus('error');
       setIsFlashed(false);
     } finally {
       setIsFlashing(false);
+      setFlashStage('');
     }
   };
 
@@ -182,6 +304,8 @@ export default function Home() {
     const bytes = new Uint8Array(arrayBuffer);
 
     setIsUploading(true);
+    setOutput('');
+    setFlashStatus('');
     try {
       const firmwareName = await core.invoke<string>("save_custom_firmware", {
         name: newFirmwareName,
@@ -192,7 +316,8 @@ export default function Home() {
       return firmwareName; // Return the firmware name
     } catch (err) {
       console.error("Upload failed:", err);
-      alert(`Failed to upload firmware: ${err}`);
+      setOutput(`Error: ${String(err)}`);
+      setFlashStatus('error');
       throw err;
     } finally {
       setIsUploading(false);
@@ -572,7 +697,7 @@ export default function Home() {
                   <div className={`border rounded-md p-3 mt-4 ${getStatusColor()} transition-colors duration-200`}>
                     <div className="flex items-start gap-2">
                       {getStatusIcon()}
-                      <pre className="text-sm whitespace-pre-wrap font-mono flex-1 overflow-x-auto">
+                      <pre className="text-sm whitespace-pre-wrap break-words font-mono flex-1 min-w-0 max-h-48 overflow-auto">
                         {output}
                       </pre>
                     </div>
@@ -642,7 +767,7 @@ export default function Home() {
                           }
                         }}
                         disabled={isFlashing || isFlashed || !selectedPort}
-                        className={`px-4 py-2 rounded-md flex items-center transition-colors ${!selectedPort || isFlashing
+                        className={`w-44 px-4 py-2 rounded-md flex items-center justify-center whitespace-nowrap tabular-nums transition-colors ${!selectedPort || isFlashing
                             ? 'bg-gray-400 cursor-not-allowed'
                             : isFlashed
                               ? 'bg-green-600 cursor-not-allowed'
@@ -652,7 +777,7 @@ export default function Home() {
                         {isFlashing ? (
                           <>
                             <RefreshCw className="animate-spin h-4 w-4 mr-2" />
-                            Flashing...
+                            {flashStage || 'Flashing...'}
                           </>
                         ) : isFlashed ? (
                           'Flashed'
@@ -717,7 +842,7 @@ export default function Home() {
                   <div className={`border rounded-md p-3 mt-4 ${getStatusColor()} transition-colors duration-200`}>
                     <div className="flex items-start gap-2">
                       {getStatusIcon()}
-                      <pre className="text-sm whitespace-pre-wrap font-mono flex-1 overflow-x-auto">
+                      <pre className="text-sm whitespace-pre-wrap break-words font-mono flex-1 min-w-0 max-h-48 overflow-auto">
                         {output}
                       </pre>
                     </div>
@@ -744,7 +869,7 @@ export default function Home() {
                       }
                     }}
                     disabled={isFlashing || isFlashed}
-                    className={`px-4 py-2 rounded-md flex items-center transition-colors ${!selectedPort || isFlashing
+                    className={`w-44 px-4 py-2 rounded-md flex items-center justify-center whitespace-nowrap tabular-nums transition-colors ${!selectedPort || isFlashing
                         ? 'bg-gray-400 cursor-not-allowed'
                         : isFlashed
                           ? 'bg-green-600 cursor-not-allowed'
@@ -754,7 +879,7 @@ export default function Home() {
                     {isFlashing ? (
                       <>
                         <RefreshCw className="animate-spin h-4 w-4 mr-2" />
-                        Flashing...
+                        {flashStage || 'Flashing...'}
                       </>
                     ) : isFlashed ? (
                       'Flashed'

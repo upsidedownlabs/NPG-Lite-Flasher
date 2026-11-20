@@ -25,6 +25,7 @@
 # Keep Cargo.lock for reproducible builds in applications
 # /src-tauri/Cargo.lock  # REMOVED - should be committed for apps
 /src-tauri/dist/    # Tauri's generated bundles
+src-tauri/binaries/
 
 # misc
 .DS_Store
